@@ -51,7 +51,7 @@ miliastra-beyond-simulator/   第三方高保真模拟器（UI 编辑+渲染试�
 projects/<玩法名>/            每个玩法项目五件套（见第 10 节）
 公开资料/                     外部收集参考（只读派生，引用规则见工具书一·12）
 refs/                         外部参考仓库（浅克隆只读；含开源游戏源码 + 千星工具链，A/B/C 运行分级见 refs/README.md）
-tools/                        工作区自研工具（gil_id_extract.py 存档ID回收 / deploy_lua.py 门禁+部署 / audit_workspace.py 手册与台账自检 / check_skill_registry.py 技能登记检查 / 导入操作卡模板 / GIL-ID回收_runbook.md）
+tools/                        工作区自研工具（gil_id_extract.py 存档ID回收 / deploy_lua.py 门禁+部署 / audit_workspace.py 手册与台账自检 / check_skill_registry.py 技能登记检查 / 导入操作卡模板 / GIL-ID回收_runbook.md / **make_share.py 发布物生成 + 发布流程.md**）
 tools/hermes-skills/          注册给 Hermes 的宿主适配技能——**只服务「千星沙箱模拟器」这一特定调试平台**（`miliastra-beyond-simulator`，原神千星奇域的第三方高保真模拟器＋MCP＋真机探针契约），**非通用组件**；正文在上游，此处仅薄适配（登记见工具书台账 #27）
 probes/                       真机探针证据原件（只读勿删，见 probes/README.md）
 ```
