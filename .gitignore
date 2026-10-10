@@ -1,0 +1,46 @@
+# ===========================================================================
+# 本分享仓的排除规则
+#
+# 原则：只排除「本工作区自己产生」的东西。
+# 上游各仓库自带的 .gitignore 由 Git 自动生效（例如 beyond-simulator 自己排除
+# dist/、Miliastra-toolbox 自己排除 node_modules/），此处不复制、不干涉 ——
+# 否则会误伤上游已入库文件。实测确认过的雷区：
+#   · refs/ikemen 跟踪 build/（是构建脚本，不是产物）
+#   · refs/miliastra-image-to-primitive-shape-ui 跟踪 gia/json_to_gia.pyc
+#   · 部分仓库跟踪 .vscode/（6 个文件）
+# ===========================================================================
+
+# --- 个人关卡产物（本分享仓未随附）---
+projects/
+
+# --- 依赖与虚拟环境 ---
+node_modules/
+.venv/
+venv/
+
+# --- 本工作区自研脚本的字节码与运行产物 ---
+tools/__pycache__/
+out/
+lua_out/
+
+# --- 真机部署回收的基线与中间物 ---
+baseline_gil.json
+
+# --- 密钥与环境变量（绝不入库；.env.example 例外）---
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# --- 编辑器 / 操作系统垃圾 ---
+.idea/
+.DS_Store
+Thumbs.db
+*.log
+
+# --- 上游仓库内的本地运行产物（非上游内容）---
+miliastra-beyond-simulator/al_assets/
+
+# --- RAG 向量库：本仓不含，由使用者自行构建（避免本地格式差异）---
+#     构建方式见 README「开箱状态清单」与 tools/bootstrap.py 第 7 项
+refs/Miliastra-toolbox/knowledge/rag_v1/db/

@@ -1,0 +1,17 @@
+* text=auto
+
+# Windows scripts
+*.ps1 eol=crlf
+*.bat eol=crlf
+
+# Unix shell
+*.sh eol=lf
+
+# ===== 【本分享仓的本地改动】=====
+# 追加 `* -text`：关闭 EOL 归一化。
+# 原因：本仓是逐字节快照，需让 clone 结果与作者工作区完全一致；
+#       原配置会把工作区的 CRLF 在入库时转成 LF，造成数千文件与源不一致。
+# 规则语义：「同一文件内后出现的模式胜出」，故本行覆盖上方全部 text/eol 设定。
+* -text
+
+

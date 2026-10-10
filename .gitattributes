@@ -1,0 +1,50 @@
+# 逐字节一致：禁用一切换行符转换
+#
+# 本仓是个人工作区的**逐字节快照**：clone 出来的文件应与源工作区完全一致。
+# 上游 16 个仓库的换行风格本就 CRLF/LF 混用（实测 4325 个已入库文本文件是 CRLF），
+# 若在这里强行归一化为 LF，会造成数千文件与源不一致。
+#
+# `* -text` = 对所有文件关闭 EOL 转换：入库与检出都按原字节。
+# 注意：不要把这里改回 `* text=auto eol=lf`——那会让 clone 结果与源产生差异。
+* -text
+
+# ---------------------------------------------------------------------------
+# 显式声明二进制（与上面 `* -text` 语义冗余，但起自文档化作用，并禁用文本 diff）
+# ---------------------------------------------------------------------------
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.webp  binary
+*.bmp   binary
+*.ico   binary
+
+*.ttf   binary
+*.otf   binary
+*.ttc   binary
+*.woff  binary
+*.woff2 binary
+
+*.exe   binary
+*.dll   binary
+*.so    binary
+*.dylib binary
+
+*.glb   binary
+*.scn   binary
+*.stex  binary
+*.res   binary
+
+# 千星编辑器资产（务必保持二进制原样）
+*.gia   binary
+*.gil   binary
+*.gir   binary
+
+*.sqlite3 binary
+*.db      binary
+*.zip     binary
+*.gz      binary
+*.7z      binary
+*.mp3     binary
+*.wav     binary
+*.mp4     binary

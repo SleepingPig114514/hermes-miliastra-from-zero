@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>千星沙箱 · 独立试玩</title>
+  <link rel="stylesheet" href="/editor/play.css">
+</head>
+<body>
+  <div class="app">
+    <header class="bar">
+      <div class="brand"><span class="icon">UI</span><strong>模拟器</strong><select id="deviceSel" class="devsel hidden" aria-label="切换设备画布" title="切换设备画布：以新画布重建运行时，GetUICanvasSize 与预设像素一致"></select><select id="playerCountSel" class="playersel hidden" aria-label="试玩人数" title="试玩人数：最多 8 人，每人一份独立客户端"></select><select id="playerViewSel" class="viewsel hidden" aria-label="当前玩家视角" title="切换当前玩家视角：输入、画面和 PlayerSelf 都跟随该玩家"></select><span class="device">设备 <b id="resolution">准备中…</b></span></div>
+      <div class="view-tabs" role="tablist" aria-label="试玩页面"><button class="active" data-view="play" role="tab">试玩</button><button data-view="log" role="tab">日志</button></div>
+      <div class="actions"><button id="audio" data-audio-toggle title="点击解锁浏览器音效">开启声音</button><button id="pause">Ⅱ 暂停运行</button><button id="step" disabled title="暂停后可单帧调试">▷ 单帧调试</button><button class="stop" id="stop">■ 结束试玩</button><button class="primary hidden" id="restart">↻ 重新开始</button><button id="theme" title="切换亮暗主题">◐</button><button id="close">返回编辑</button></div>
+    </header>
+    <div class="views">
+      <main class="workspace play-view" id="workspace"><div class="stage-shell veiled" id="shell"><div class="stage-label" id="stageLabel"></div><div class="stage" id="stage"><canvas id="cv" class="stage-canvas"></canvas></div></div><div class="loading" id="loading"><span class="spin"></span>正在准备试玩…</div><div class="fatal hidden" id="fatal"></div></main>
+      <section class="debug-view hidden" id="logView">
+        <aside class="panel tree-panel"><div class="panel-head">运行时场景树 <small id="nodeCount">0 节点</small></div><div class="tree" id="sceneTree"></div><div class="panel-head">服务端变量 <small id="varCount">0 项</small></div><div class="vars" id="serverVars"></div></aside>
+        <div class="log-stack"><main class="panel log-panel"><div class="panel-head">客户端脚本日志 <small>最近 100 条</small></div><div class="log" id="log"></div></main><aside class="panel log-panel"><div class="panel-head">服务端日志 <small>变量 / 信号</small></div><div class="log" id="serverLog"></div></aside><section class="panel case-panel"><div class="panel-head">自动测用例 <small id="caseHint">先试玩，再保存回放</small></div><div class="case-body"><textarea id="caseAsserts" spellcheck="false" placeholder='断言 JSON 数组，例如 [{"kind":"log","contains":"clicked"}]'></textarea><button id="saveCase">保存用例</button><button id="runCase">回放用例</button></div></section></div>
+      </section>
+    </div>
+    <footer class="status"><span class="live" id="state">● 正在启动</span><span id="viewMode">页面：试玩</span><span class="spacer"></span><span class="metric" id="frame">Frame 0</span><span class="metric" id="time">0.00s</span></footer>
+  </div>
+  <script type="module" src="/editor/play.js"></script>
+</body>
+</html>

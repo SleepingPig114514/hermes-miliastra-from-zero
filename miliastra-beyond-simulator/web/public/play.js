@@ -1,0 +1,374 @@
+
+    import { PixiPlayRenderer, createPlaySession } from '/editor/play-renderer.js'
+
+    (() => {
+      'use strict'
+      const API = '/editor/api/play'
+      const sessionId = decodeURIComponent(location.hash.slice(1))
+      const embedded = window.parent !== window && new URLSearchParams(location.search).get('embedded') === '1'
+      let closing = false
+      let stopped = false
+      let embeddedApi = null
+      const $ = (id) => document.getElementById(id)
+      const stage = $('stage')
+      const cv = $('cv')
+      const renderer = new PixiPlayRenderer(cv)
+      const shell = $('shell')
+      const workspace = $('workspace')
+      const logView = $('logView')
+      let theme = matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'
+      let fittedCanvas = ''
+
+      function applyTheme() { document.body.dataset.theme = theme }
+      applyTheme()
+
+      function setView(view) {
+        const showLog = view === 'log'
+        workspace.classList.toggle('hidden', showLog)
+        logView.classList.toggle('hidden', !showLog)
+        $('viewMode').textContent = showLog ? '页面：日志' : '页面：试玩'
+        for (const button of document.querySelectorAll('[data-view]')) button.classList.toggle('active', button.dataset.view === view)
+        if (!showLog) requestAnimationFrame(() => fitStage(true))
+      }
+
+      function api(action, args = {}) {
+        if (closing && action !== 'stop') return Promise.reject(new Error('试玩正在关闭'))
+        return embeddedApi ? embeddedApi(action, args) : request(action, args)
+      }
+      async function request(action, args) {
+        const response = await fetch(API, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ sessionId, action, args }),
+          signal: AbortSignal.timeout(15_000),
+        })
+        const envelope = await response.json().catch(() => null)
+        if (!response.ok || !envelope || envelope.ok !== true) throw new Error(envelope?.error || '试玩请求失败')
+        return envelope.value
+      }
+
+      function renderVars(rows) {
+        const host = $('serverVars')
+        host.replaceChildren()
+        const list = Array.isArray(rows) ? rows : []
+        $('varCount').textContent = list.length + ' 项'
+        if (!list.length) {
+          const empty = document.createElement('div')
+          empty.className = 'var-empty'
+          empty.textContent = '暂无自定义变量。脚本 Get/Set 或 serverSet 之后会出现在这里。'
+          host.appendChild(empty)
+          return
+        }
+        for (const row of list) {
+          const el = document.createElement('div')
+          el.className = 'var-row'
+          const type = row.type || '—'
+          const value = row.value === undefined ? 'nil' : JSON.stringify(row.value)
+          const entityCell = document.createElement('span')
+          entityCell.textContent = row.entityLabel || row.entityType || ''
+          const nameCell = document.createElement('b')
+          nameCell.textContent = row.name || ''
+          const typeCell = document.createElement('span')
+          typeCell.textContent = type
+          const valueCell = document.createElement('span')
+          valueCell.textContent = value
+          el.append(entityCell, nameCell, typeCell, valueCell)
+          host.appendChild(el)
+        }
+      }
+
+      function renderTree(snapshot) {
+        const host = $('sceneTree')
+        host.replaceChildren()
+        const empty = document.createElement('div')
+        empty.className = 'var-empty'
+        empty.textContent = '完整运行树请用 Agent 的 inspect 快照。舞台按左树上方盖住下方绘制。'
+        host.appendChild(empty)
+        $('nodeCount').textContent = (snapshot?.scene?.count || snapshot?.paint?.length || 0) + ' 个可见图元'
+      }
+
+      function fitStage(force = false) {
+        const snapshot = play.snapshot
+        if (!snapshot) return
+        const key = snapshot.canvasWidth + '×' + snapshot.canvasHeight
+        if (!force && (fittedCanvas === key || !Number.isFinite(snapshot.canvasWidth) || !Number.isFinite(snapshot.canvasHeight))) return
+        fittedCanvas = key
+        const maxW = Math.max(120, workspace.clientWidth - 48)
+        const maxH = Math.max(80, workspace.clientHeight - 48)
+        const scale = Math.min(maxW / snapshot.canvasWidth, maxH / snapshot.canvasHeight)
+        if (!Number.isFinite(scale) || scale <= 0) return
+        shell.style.width = (snapshot.canvasWidth * scale) + 'px'
+        shell.style.height = (snapshot.canvasHeight * scale) + 'px'
+        stage.style.width = '100%'
+        stage.style.height = '100%'
+      }
+
+      function revealStage() {
+        shell.classList.remove('veiled')
+        $('loading').classList.add('hidden')
+      }
+
+      function applyStatus(next) {
+        $('frame').textContent = 'Frame ' + (next.frame || 0)
+        $('time').textContent = Number(next.time || 0).toFixed(2) + 's'
+        $('pause').textContent = next.paused ? '▶ 继续运行' : 'Ⅱ 暂停运行'
+        $('pause').disabled = false
+        $('step').disabled = !next.paused
+      }
+
+      function syncDeviceSelect(next) {
+        const sel = $('deviceSel')
+        const presets = Array.isArray(next.canvasPresets) ? next.canvasPresets : []
+        if (!presets.length || !next.canvasId) {
+          sel.replaceChildren()
+          sel.classList.add('hidden')
+          return
+        }
+        const stale = sel.options.length !== presets.length
+          || [...sel.options].some((opt, i) => opt.value !== presets[i].id)
+        if (stale) {
+          sel.replaceChildren(...presets.map((preset) => {
+            const opt = document.createElement('option')
+            opt.value = preset.id
+            opt.textContent = preset.label || (preset.id + ' · ' + preset.width + '×' + preset.height)
+            return opt
+          }))
+        }
+        if (sel.value !== next.canvasId) sel.value = next.canvasId
+        sel.classList.remove('hidden')
+      }
+
+      function fillCountSelect(sel, count) {
+        const n = Math.max(1, Math.min(8, Number(count) || 1))
+        if (sel.options.length !== 8) {
+          sel.replaceChildren(...Array.from({ length: 8 }, (_, i) => {
+            const opt = document.createElement('option')
+            opt.value = String(i + 1)
+            opt.textContent = (i + 1) + ' 人'
+            return opt
+          }))
+        }
+        sel.value = String(n)
+        sel.classList.remove('hidden')
+        return n
+      }
+
+      function syncPlayerSelects(next) {
+        const countSel = $('playerCountSel')
+        const viewSel = $('playerViewSel')
+        const count = fillCountSelect(countSel, next.playerCount || 1)
+        const players = Array.isArray(next.players) && next.players.length
+          ? next.players
+          : Array.from({ length: count }, (_, i) => ({ index: i + 1, label: '玩家' + (i + 1) }))
+        const stale = viewSel.options.length !== players.length
+          || [...viewSel.options].some((opt, i) => Number(opt.value) !== players[i].index)
+        if (stale) {
+          viewSel.replaceChildren(...players.map((player) => {
+            const opt = document.createElement('option')
+            opt.value = String(player.index)
+            opt.textContent = player.label || ('玩家' + player.index)
+            return opt
+          }))
+        }
+        const view = Number(next.viewPlayerIndex) || 1
+        if (viewSel.value !== String(view)) viewSel.value = String(view)
+        viewSel.classList.toggle('hidden', count < 2)
+      }
+
+      async function renderChrome(next) {
+        $('fatal').classList.add('hidden')
+        fitStage()
+        syncDeviceSelect(next)
+        syncPlayerSelects(next)
+        $('resolution').textContent = next.canvasWidth + '×' + next.canvasHeight
+        const viewLabel = next.playerCount > 1 ? (' · 玩家' + (next.viewPlayerIndex || 1)) : ''
+        $('stageLabel').textContent = next.canvasWidth + '×' + next.canvasHeight + viewLabel + ' · 点击输入'
+        applyStatus(next)
+        $('stop').disabled = false
+        $('restart').classList.add('hidden')
+        $('state').textContent = next.mountError ? '⚠ 脚本挂载失败' : next.paused ? 'Ⅱ 已暂停' : '● 试玩运行中'
+        $('state').className = next.mountError ? 'error' : 'live'
+        renderTree(next)
+        renderVars(next.serverVars)
+        $('log').textContent = (next.logs || []).slice(-100).map((entry) => Number(entry.time || 0).toFixed(2).padStart(7, ' ') + '  [' + entry.level + ']  ' + entry.text).join('\n')
+        $('serverLog').textContent = (next.serverLogs || next.server?.logs || []).slice(-100).map((entry) => Number(entry.time || 0).toFixed(2).padStart(7, ' ') + '  [' + entry.level + ']  ' + entry.text).join('\n')
+        $('caseHint').textContent = (next.history && next.history.length ? ('已记录 ' + next.history.length + ' 步') : '先试玩，再保存回放')
+        if (next.mountError) setView('log')
+      }
+
+      function showError(error) {
+        if (closing) return
+        $('loading').classList.add('hidden')
+        $('fatal').classList.remove('hidden')
+        $('fatal').textContent = error?.message || String(error)
+        $('state').className = 'error'
+        $('state').textContent = '⚠ 试玩错误'
+      }
+
+      const play = createPlaySession({
+        renderer,
+        api,
+        onSnapshot: renderChrome,
+        onStatus: applyStatus,
+        onError: showError,
+        onAudioStatus: status => {
+          $('audio').textContent = !status.unlocked ? '开启声音' : status.muted ? '声音已关闭' : '声音已开启'
+          $('audio').title = status.error || (!status.unlocked ? '点击或在画布内操作以解锁音效' : '切换静音')
+        },
+        isActive: () => !closing,
+      })
+      play.bindInput(stage, { keysOn: window })
+      $('audio').addEventListener('click', () => play.audio?.toggle())
+
+      $('step').addEventListener('click', () => void play.act('step', { dt: 1 / 30 }))
+      $('pause').addEventListener('click', () => void play.act(play.snapshot?.paused ? 'resume' : 'pause'))
+      $('stop').addEventListener('click', async () => {
+        if (!play.running) return
+        try { await play.stop() } catch (error) { showError(error); return }
+        $('state').textContent = '■ 试玩已结束，可重新开始或返回编辑'
+        $('state').className = ''
+        $('pause').disabled = true
+        $('step').disabled = true
+        $('stop').disabled = true
+        $('restart').classList.remove('hidden')
+      })
+      $('restart').addEventListener('click', async () => {
+        try {
+          fittedCanvas = ''
+          const keepArgs = {}
+          const snapshot = play.snapshot
+          if (snapshot?.canvasId) keepArgs.canvasId = snapshot.canvasId
+          if (snapshot?.playerCount) keepArgs.playerCount = snapshot.playerCount
+          if (snapshot?.viewPlayerIndex) keepArgs.viewPlayerIndex = snapshot.viewPlayerIndex
+          await play.start(keepArgs)
+          fitStage(true)
+        } catch (error) { showError(error) }
+      })
+      $('playerCountSel').addEventListener('change', async () => {
+        const playerCount = Number($('playerCountSel').value) || 1
+        try {
+          shell.classList.add('veiled')
+          $('loading').classList.remove('hidden')
+          fittedCanvas = ''
+          const args = { playerCount, viewPlayerIndex: 1 }
+          if (play.snapshot?.canvasId) args.canvasId = play.snapshot.canvasId
+          await play.start(args)
+          fitStage(true)
+          revealStage()
+        } catch (error) { showError(error) }
+      })
+      $('playerViewSel').addEventListener('change', async () => {
+        const playerIndex = Number($('playerViewSel').value) || 1
+        if (!play.snapshot || !play.running) return
+        try { await play.view({ playerIndex }) }
+        catch (error) { showError(error) }
+      })
+      $('deviceSel').addEventListener('change', async () => {
+        const canvasId = $('deviceSel').value
+        if (!canvasId) return
+        try {
+          shell.classList.add('veiled')
+          $('loading').classList.remove('hidden')
+          fittedCanvas = ''
+          await play.device({
+            canvasId,
+            playerCount: play.snapshot?.playerCount || 1,
+            viewPlayerIndex: play.snapshot?.viewPlayerIndex || 1,
+          })
+          fitStage(true)
+          revealStage()
+        } catch (error) { showError(error) }
+      })
+      function quiesce() {
+        closing = true
+        document.querySelector('.app').inert = true
+        play.reset()
+      }
+      function focusStage() {
+        stage.tabIndex = -1
+        stage.focus({ preventScroll: true })
+      }
+      stage.addEventListener('pointerdown', focusStage)
+      function requestEmbeddedClose() {
+        // Custom desktop schemes can serialize their origin as "null".
+        // The parent checks the exact iframe WindowProxy and session id.
+        parent.postMessage({ type: 'qxqy-play-close', sessionId }, location.origin === 'null' ? '*' : location.origin)
+      }
+      addEventListener('keydown', event => {
+        if (embedded && event.key === 'Escape') { event.preventDefault(); requestEmbeddedClose() }
+      })
+      $('close').addEventListener('click', async () => {
+        if (embedded) {
+          requestEmbeddedClose()
+          return
+        }
+        try {
+          quiesce()
+          await api('stop')
+          stopped = true
+          window.close()
+        } catch (error) {
+          closing = false
+          document.querySelector('.app').inert = false
+          showError(error)
+        }
+      })
+      $('theme').addEventListener('click', () => { theme = theme === 'dark' ? 'light' : 'dark'; applyTheme() })
+      let lastCase = null
+      function parseAsserts() {
+        const text = $('caseAsserts').value.trim()
+        if (!text) return []
+        const parsed = JSON.parse(text)
+        if (!Array.isArray(parsed)) throw new Error('断言必须是 JSON 数组')
+        return parsed
+      }
+      $('saveCase').addEventListener('click', async () => {
+        try {
+          lastCase = await api('saveCase', { name: 'play-case', asserts: parseAsserts() })
+          $('caseHint').textContent = '已保存 ' + (lastCase.events || []).length + ' 步 / ' + (lastCase.asserts || []).length + ' 条断言'
+        } catch (error) { showError(error) }
+      })
+      $('runCase').addEventListener('click', async () => {
+        try {
+          if (!lastCase) lastCase = await api('saveCase', { name: 'play-case', asserts: parseAsserts() })
+          const report = await api('runCase', { case: lastCase })
+          $('caseHint').textContent = report.passed ? '回放通过' : ('回放失败 @' + (report.failedAt ?? '?') + 's')
+          if (!report.passed) setView('log')
+        } catch (error) { showError(error) }
+      })
+      for (const button of document.querySelectorAll('[data-view]')) button.addEventListener('click', () => setView(button.dataset.view))
+      addEventListener('resize', () => fitStage(true))
+      addEventListener('pagehide', () => {
+        closing = true
+        play.destroy()
+        // Embedded close/unmount is owned by the parent. A late keepalive stop
+        // from the old frame must never terminate the next play session.
+        if (!embedded && !stopped) fetch(API, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ sessionId, action: 'stop', args: {} }), keepalive: true }).catch(() => {})
+      })
+      if (embedded) {
+        // Closing the whole application document has no awaitable teardown.
+        // This fallback is separate from normal modal close, which awaits stop.
+        const parentPagehide = () => {
+          quiesce()
+          fetch(API, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ sessionId, action: 'stop', args: {} }), keepalive: true }).catch(() => {})
+        }
+        parent.addEventListener('pagehide', parentPagehide)
+        addEventListener('pagehide', () => parent.removeEventListener('pagehide', parentPagehide))
+      }
+
+      if (!sessionId) showError(new Error('缺少会话 ID'))
+      else if (embedded) {
+        // Wait for the parent's load handler: closing a still-loading iframe
+        // must not race an automatic start from this document.
+        window.qxqyEmbeddedPlay = {
+          start: request => {
+            if (closing) return Promise.resolve()
+            embeddedApi = request
+            return play.start().then(() => { if (closing) play.reset(); else { revealStage(); focusStage() } })
+          },
+          quiesce,
+          focus: focusStage,
+        }
+      } else play.start().then(() => setTimeout(revealStage, 0)).catch(showError)
+    })()
+  

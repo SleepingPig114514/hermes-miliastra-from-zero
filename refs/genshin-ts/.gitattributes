@@ -1,0 +1,11 @@
+* text=auto eol=lf
+
+resources/** linguist-generated
+src/definitions/** linguist-generated
+src/thirdparty/** linguist-vendored
+src/tests/** linguist-generated
+
+*.png binary
+*.jpg binary
+*.gif binary
+*.ico binary

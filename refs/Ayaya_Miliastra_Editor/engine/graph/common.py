@@ -1,0 +1,610 @@
+from __future__ import annotations
+
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+
+from engine.graph.models import EdgeModel, GraphModel, NodeModel
+from engine.nodes.node_definition_loader import NodeDef
+from engine.utils.graph.graph_utils import is_flow_port_name
+from engine.nodes.port_type_system import is_flow_port_with_context
+from engine.type_registry import (
+    TYPE_BOOLEAN,
+    TYPE_DICT,
+    TYPE_FLOAT,
+    TYPE_INTEGER,
+    TYPE_LIST_PLACEHOLDER,
+    TYPE_STRING,
+)
+from engine.utils.graph.graph_algorithms import (
+    group_nodes_by_event,
+    group_nodes_by_event_with_topo_order,
+)
+from engine.utils.name_utils import make_valid_identifier
+
+
+def group_by_event(
+    graph_model: GraphModel,
+    include_data_dependencies: bool = False,
+) -> Dict[str, List[str]]:
+    """统一的事件分组入口。
+
+    - include_data_dependencies: 是否将数据依赖节点纳入事件流成员集合。
+    - 直接委托 `engine.utils.graph.graph_algorithms.group_nodes_by_event`。
+    """
+    return group_nodes_by_event(graph_model, include_data_dependencies=include_data_dependencies)
+
+
+def group_by_event_with_topo_order(
+    graph_model: GraphModel,
+    include_data_dependencies: bool = False,
+) -> Dict[str, List[str]]:
+    """事件分组（拓扑有序）统一入口。"""
+    return group_nodes_by_event_with_topo_order(
+        graph_model, include_data_dependencies=include_data_dependencies
+    )
+
+
+def format_constant(raw_value: Any) -> str:
+    """将常量值格式化为合法的 Python 字面量字符串。
+
+    规则：
+    - 保持“值类型”稳定：str 永远输出为字符串字面量（避免 "123" 被误输出成 123）
+    - None/True/False、整数/浮点保持为对应字面量
+    - 仅允许极少数“表达式哨兵”不加引号直出（例如由上层注入的 self.owner_entity）
+    - 其他一律按字符串处理，使用双引号包裹，并转义内部双引号与反斜杠
+    """
+    if raw_value is None:
+        return "None"
+    if isinstance(raw_value, bool):
+        return "True" if raw_value else "False"
+    if isinstance(raw_value, (int, float)):
+        return repr(raw_value)
+
+    if isinstance(raw_value, str):
+        s = raw_value.strip()
+        if not s:
+            return '""'
+        # 已包裹引号的字符串原样返回（主要用于兼容历史/人工注入的场景）
+        if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
+            return s
+        # 保留特定表达式（由上层注入的标识）
+        if s == "self.owner_entity":
+            return s
+        escaped = s.replace("\\", r"\\").replace('"', r"\"")
+        return f'"{escaped}"'
+
+    # 兜底：使用 repr，避免 str(...) 产生不可解析/歧义输出
+    return repr(raw_value)
+
+
+def collect_input_params(
+    node: NodeModel,
+    graph_model: GraphModel,
+    var_mapping: Dict[Tuple[str, str], str],
+) -> Dict[str, str]:
+    """收集节点的数据输入参数，返回 {参数名: 参数值代码字符串}。
+
+    - 跳过流程端口
+    - 有连线则使用变量映射
+    - 无连线则使用 node.input_constants；若缺省则使用空字符串
+    - 可变参数端口保持端口名（如 "0~99"、"0","1"），供上层选择按位置/关键字生成
+    """
+    params: Dict[str, str] = {}
+    data_inputs = [p for p in node.inputs if not is_flow_port(node, p.name, False)]
+
+    data_input_index = _get_data_input_edge_index(graph_model)
+    per_node_inputs = data_input_index.get(node.id, {})
+
+    for port in data_inputs:
+        connected_edge = per_node_inputs.get(port.name)
+        if connected_edge is not None:
+            source_key = (connected_edge.src_node, connected_edge.src_port)
+            mapped = var_mapping.get(source_key)
+            params[port.name] = mapped if mapped is not None else '"unknown"'
+            continue
+
+        if port.name in node.input_constants:
+            raw_value = node.input_constants[port.name]
+            params[port.name] = format_constant(raw_value)
+        else:
+            params[port.name] = '""'
+
+    return params
+
+
+def render_call_expression(func_name: str, primary_arg: str, extra_args: Iterable[str]) -> str:
+    """统一的函数调用字符串生成工具（过滤空参数并保持顺序）。"""
+    args = [primary_arg]
+    args.extend(arg for arg in extra_args if arg)
+    args_str = ", ".join(args)
+    return f"{func_name}({args_str})"
+
+
+def finalize_output_var_names(
+    raw_names: Sequence[str],
+    *,
+    used_names: Optional[Set[str]] = None,
+    counter: Optional[VarNameCounter] = None,
+) -> List[str]:
+    """规范化并去重输出变量名，必要时回退到统一生成策略。"""
+    reserve = used_names if used_names is not None else set()
+    finalized: List[str] = []
+    for raw in raw_names:
+        candidate = make_valid_identifier(raw or "")
+        if not candidate or candidate == "_":
+            candidate = _fallback_var_name(counter)
+        while candidate in reserve:
+            candidate = _fallback_var_name(counter, base=candidate)
+        reserve.add(candidate)
+        finalized.append(candidate)
+    return finalized
+
+
+def _fallback_var_name(counter: Optional[VarNameCounter], base: Optional[str] = None) -> str:
+    if counter is not None:
+        return generate_unique_var_name(counter)
+    seed = base or "value"
+    return f"{seed}_var"
+
+
+def _get_data_input_edge_index(graph_model: GraphModel) -> Dict[str, Dict[str, EdgeModel]]:
+    cache = getattr(graph_model, "_cached_data_input_edges", None)
+    cache_revision = getattr(graph_model, "_cached_data_input_edges_revision", None)
+    cache_len = getattr(graph_model, "_cached_data_input_edges_len", None)
+    current_len = len(graph_model.edges)
+    current_revision = getattr(graph_model, "_edges_revision", None)
+    if not isinstance(current_revision, int):
+        current_revision = 0
+
+    if cache is not None and cache_revision == current_revision and cache_len == current_len:
+        return cache
+
+    index: Dict[str, Dict[str, EdgeModel]] = {}
+    for edge in graph_model.edges.values():
+        dst_node = graph_model.nodes.get(edge.dst_node)
+        if dst_node is None:
+            continue
+        if is_flow_port(dst_node, edge.dst_port, False):
+            continue
+        per_node = index.setdefault(edge.dst_node, {})
+        per_node.setdefault(edge.dst_port, edge)
+
+    setattr(graph_model, "_cached_data_input_edges", index)
+    setattr(graph_model, "_cached_data_input_edges_revision", current_revision)
+    setattr(graph_model, "_cached_data_input_edges_len", current_len)
+    return index
+
+
+class VarNameCounter:
+    """简单的递增计数器，用于生成唯一变量名。"""
+
+    def __init__(self, start: int = 0) -> None:
+        if start < 0:
+            raise ValueError("start must be non-negative")
+        self._value = int(start)
+
+    def next(self) -> int:
+        self._value += 1
+        return self._value
+
+
+def generate_unique_var_name(counter: VarNameCounter) -> str:
+    """统一的 var_ 命名策略。"""
+    return f"var_{counter.next()}"
+
+
+def choose_output_var_names(
+    node: NodeModel,
+    output_ports: List[Any],
+    *,
+    prefer_custom_names: bool = True,
+    fallback: str = "port_name",  # "port_name" | "generated"
+    counter: Optional[VarNameCounter] = None,
+) -> List[str]:
+    """为数据输出端口选择变量名。
+
+    - prefer_custom_names=True 时优先使用 `node.custom_var_names`（支持 list 或 dict[name->var] 两种约定）
+    - fallback:
+        - "port_name": 使用端口名
+        - "generated": 使用统一的 var_ 生成（要求提供 counter）
+    """
+    names: List[str] = []
+    custom_map: Dict[str, str] = {}
+    if hasattr(node, 'custom_var_names') and node.custom_var_names:
+        if isinstance(node.custom_var_names, dict):
+            custom_map = {str(k): str(v) for k, v in node.custom_var_names.items()}
+        elif isinstance(node.custom_var_names, list):
+            # list 对应输出序号
+            for idx, port in enumerate(output_ports):
+                if idx < len(node.custom_var_names):
+                    custom_map[str(getattr(port, 'name', str(idx)))] = str(node.custom_var_names[idx])
+
+    for idx, port in enumerate(output_ports):
+        port_name = getattr(port, 'name', f"out_{idx}")
+        chosen: Optional[str] = None
+        if prefer_custom_names and port_name in custom_map:
+            chosen = custom_map[port_name]
+        if chosen is None:
+            if fallback == "port_name":
+                chosen = port_name
+            elif fallback == "generated":
+                if counter is None:
+                    raise ValueError("counter is required when fallback='generated'")
+                chosen = generate_unique_var_name(counter)
+            else:
+                raise ValueError("invalid fallback option")
+        names.append(chosen)
+
+    return names
+
+
+# 统一流程端口判定入口（优先上下文，回退名称匹配）
+def is_flow_port(node: Optional[Any], port_name: str, is_source: bool) -> bool:
+    """
+    统一的流程端口判定：
+    - 若提供了 node（具备 title/inputs/outputs 等属性），优先使用上下文感知判定；
+    - 否则回退到基于名称的快速判定。
+    """
+    if node is not None:
+        return is_flow_port_with_context(node, port_name, is_source)
+    return is_flow_port_name(port_name)
+
+
+# 统一：Python 类型 ↔ 引脚类型 映射（供解析/生成双向使用）
+PYTHON_TYPE_TO_PIN_TYPE: Dict[str, str] = {
+    "float": TYPE_FLOAT,
+    "int": TYPE_INTEGER,
+    "str": TYPE_STRING,
+    "bool": TYPE_BOOLEAN,
+    "list": TYPE_LIST_PLACEHOLDER,
+    "dict": TYPE_DICT,
+}
+PIN_TYPE_TO_PYTHON_TYPE: Dict[str, str] = {v: k for k, v in PYTHON_TYPE_TO_PIN_TYPE.items()}
+
+
+def validate_pin_type_annotation(type_name: str, allow_python_builtin: bool = False) -> str:
+    """验证端口类型标注是否合法
+    
+    规则：
+    - 优先接受中文端口类型（整数、浮点数、字符串、布尔值、实体、三维向量等）；
+    - 在允许的场景下，可接受 Python 内置类型名（int、float、str、bool、list、dict），并自动转换为中文端口类型；
+    - 在不允许 Python 内置类型名的场景下，遇到这些标注会记录告警并回退为“泛型”，避免阻断整体加载；
+    - 其他未识别的类型一律回退为“泛型”。
+    
+    Args:
+        type_name: 类型名称
+        allow_python_builtin: 是否允许Python内置类型（True时自动转换）
+        
+    Returns:
+        规范化的端口类型名称
+        
+    Raises:
+        ValueError: 对于被明确禁止的类型标注（如“通用”/Any 等）
+    """
+    from engine.type_registry import (
+        BANNED_TYPE_ALIASES,
+        PIN_TYPE_ANNOTATION_ALLOWED_TYPES,
+        parse_typed_dict_alias,
+        TYPE_GENERIC,
+        TYPE_DICT,
+        TYPE_FLOW,
+        TYPE_GENERIC_DICT,
+        TYPE_GENERIC_LIST,
+        TYPE_LIST_PLACEHOLDER,
+    )
+
+    # 允许的中文类型集合（唯一事实来源：engine.type_registry）
+    allowed_types: set = set(PIN_TYPE_ANNOTATION_ALLOWED_TYPES)
+
+    type_name = type_name.strip()
+    # 严禁旧称与 Any（从源头掐灭）
+    if type_name in BANNED_TYPE_ALIASES:
+        raise ValueError(f"不支持的类型标注 '{type_name}'：请使用“泛型”")
+    
+    # 已是中文类型，直接返回
+    if type_name in allowed_types:
+        return type_name
+
+    # 别名字典（键类型_值类型字典 / 键类型-值类型字典）
+    #
+    # 说明：
+    # - 该类型名集合是“无限”的，不能靠静态 set 穷举；
+    # - 但它是合法且可校验的中文端口类型标注（在复合节点 pins、图变量等处都需要稳定表达 K/V）。
+    ok_alias, key_type, value_type = parse_typed_dict_alias(type_name)
+    if ok_alias:
+        # 键/值必须是可接受的中文端口类型（基础或列表），且不能是“占位型”（泛型/列表/字典/流程）。
+        if (
+            key_type in allowed_types
+            and value_type in allowed_types
+            and key_type not in {TYPE_GENERIC, TYPE_GENERIC_LIST, TYPE_GENERIC_DICT, TYPE_LIST_PLACEHOLDER, TYPE_DICT, TYPE_FLOW}
+            and value_type not in {TYPE_GENERIC, TYPE_GENERIC_LIST, TYPE_GENERIC_DICT, TYPE_LIST_PLACEHOLDER, TYPE_DICT, TYPE_FLOW}
+        ):
+            return type_name
+    
+    # Python内置类型处理
+    if type_name in PYTHON_TYPE_TO_PIN_TYPE:
+        mapped = PYTHON_TYPE_TO_PIN_TYPE[type_name]
+        if allow_python_builtin:
+            # 允许 Python 内置类型时，做显式的“英文 → 中文”类型映射。
+            return mapped
+
+        # 默认场景：不允许在资源/复合节点中直接使用 Python 内置类型名。
+        # 为避免单个复合节点写错导致整个程序无法启动，这里采用“记录告警 + 回退为泛型”的策略，
+        # 具体类型问题交由后续图验证工具或资源校验脚本暴露。
+        from engine.utils.logging.logger import log_warn
+
+        log_warn(
+            "类型标注 '{}' 在当前上下文不允许直接使用 Python 内置类型名，"
+            "已按 '泛型' 处理；推荐改为显式的中文端口类型（如：整数/浮点数/字符串/布尔值/字典/列表/泛型/泛型列表/泛型字典 等）。",
+            type_name,
+        )
+        return TYPE_GENERIC
+    
+    # 未识别的类型，回退为"泛型"
+    return TYPE_GENERIC
+    
+
+def node_name_index_from_library(
+    node_library: Dict[str, NodeDef],
+    *,
+    scope: str | None = None,
+) -> Dict[str, str]:
+    """统一的节点名称“同义/别名”索引构建（支持按作用域优先映射）。
+
+    规则（无 scope 时保持旧行为）：
+    - key 形如 \"类别/节点名\"
+    - 节点名原样→索引
+    - 若节点名中包含'/'，同时收录：去掉斜杠 的别名
+    - 注意：仅按第一个'/'分割类别；名称部分可能继续包含'/'（如“激活/关闭*”）
+
+    规则（提供 scope=server|client 时）：
+    - 仅收录 `NodeDef.is_available_in_scope(scope)` 为 True 的节点；
+    - 若同时存在 `名称#scope` 变体键，则将无后缀的 `名称` 映射到该变体，
+      以便 Graph Code 在不同 graph_type 下仍可直接调用 `名称(...)`。
+    """
+
+    allowed_scopes = {"server", "client"}
+    normalized_scope = str(scope or "").strip().lower()
+    if normalized_scope not in allowed_scopes:
+        # 兼容旧行为：不做作用域筛选，也不做 `名称 -> 名称#scope` 的重定向
+        index: Dict[str, str] = {}
+        for full_key in node_library.keys():
+            if "/" not in full_key:
+                continue
+            _, node_name = full_key.split("/", 1)
+            index[node_name] = full_key
+            if "/" in node_name:
+                index.setdefault(node_name.replace("/", ""), full_key)
+                # 兼容：部分导出/生成链路会把 `/` 写成 “或”（例如 `实体移除或销毁时`），这里补充同义索引。
+                index.setdefault(node_name.replace("/", "或"), full_key)
+        return index
+
+    def _split_scope_suffix(node_name: str) -> tuple[str, str | None]:
+        # 约定：作用域变体键为 `名称#scope`（由 nodes pipeline merger 生成）
+        if "#" not in node_name:
+            return node_name, None
+        base, suffix = node_name.rsplit("#", 1)
+        suffix_text = str(suffix or "").strip().lower()
+        if suffix_text in allowed_scopes:
+            return base, suffix_text
+        return node_name, None
+
+    # 先收集“可用节点”到索引：允许显式写 `名称#scope`，也允许依赖别名（去掉 '/'）
+    index: Dict[str, str] = {}
+    candidates_by_base_name: Dict[str, Dict[str, str]] = {}
+
+    for full_key, node_def in (node_library or {}).items():
+        if "/" not in full_key:
+            continue
+
+        if not (node_def and node_def.is_available_in_scope(normalized_scope)):
+            continue
+
+        _, node_name = full_key.split("/", 1)
+        index[node_name] = full_key
+        if "/" in node_name:
+            index.setdefault(node_name.replace("/", ""), full_key)
+            # 兼容：部分导出/生成链路会把 `/` 写成 “或”（例如 `实体移除或销毁时`），这里补充同义索引。
+            index.setdefault(node_name.replace("/", "或"), full_key)
+
+        base_name, suffix_scope = _split_scope_suffix(node_name)
+        bucket = candidates_by_base_name.setdefault(base_name, {})
+        if suffix_scope is None:
+            bucket.setdefault("", full_key)
+        else:
+            bucket.setdefault(suffix_scope, full_key)
+
+    # 将“无后缀名称”重定向到当前 scope 的变体（若存在），否则回退到无后缀基键
+    for base_name, candidates in candidates_by_base_name.items():
+        chosen_key = candidates.get(normalized_scope) or candidates.get("")
+        if not chosen_key:
+            continue
+        index[base_name] = chosen_key
+        if "/" in base_name:
+            index.setdefault(base_name.replace("/", ""), chosen_key)
+            index.setdefault(base_name.replace("/", "或"), chosen_key)
+
+    return index
+
+
+# 流程端口与占位符名称（集中定义，供引擎/UI/自动化复用）
+FLOW_PORT_PLACEHOLDER: str = "flow"
+# 标准流程输出端口名（节点定义与 UI 展示中的中文名称）
+FLOW_OUT_PORT_NAMES: Tuple[str, ...] = ("流程出", "是", "否", "默认", "循环体", "循环完成")
+# 标准流程输入端口名（含“跳出循环”等特殊入口）
+FLOW_IN_PORT_NAMES: Tuple[str, ...] = ("流程入", "跳出循环")
+# 分支类流程端口常见别名（英文/中文混用场景统一收敛到此）
+FLOW_BRANCH_PORT_ALIASES: Tuple[str, ...] = ("true", "false", "是", "否", "默认", "循环体", "循环完成")
+# 兼容旧代码的聚合常量：包含所有常见流程输出口以及“跳出循环”
+FLOW_SPECIAL_OUTPUT_NAMES: Tuple[str, ...] = FLOW_OUT_PORT_NAMES + (FLOW_IN_PORT_NAMES[-1],)
+
+
+# 分支/循环节点名称集合与判定
+BRANCH_NODE_NAMES: Tuple[str, ...] = ("双分支", "多分支")
+LOOP_NODE_NAMES: Tuple[str, ...] = ("有限循环", "列表迭代循环")
+
+
+def is_branch_node_name(node_name: str) -> bool:
+    return node_name in BRANCH_NODE_NAMES
+
+
+def is_loop_node_name(node_name: str) -> bool:
+    return node_name in LOOP_NODE_NAMES
+
+
+# 信号节点标题与静态端口名（集中定义，避免 UI 层散落硬编码）
+SIGNAL_SEND_NODE_TITLE: str = "发送信号"
+SIGNAL_LISTEN_NODE_TITLE: str = "监听信号"
+
+# ----------------------------------------------------------------------------
+# 客户端节点图“模板锚点节点”约定（用于 UI 自动化 / Todo 执行）
+#
+# 说明：
+# - 这些节点在“新建对应类型节点图”时由编辑器模板自动生成；
+# - 自动化执行与步骤生成应将其视为锚点节点：不再生成 create_node 步骤，
+#   并可用于首轮坐标校准与后续创建节点的锚点选择。
+# ----------------------------------------------------------------------------
+
+CLIENT_SKILL_GRAPH_DIRNAME: str = "技能节点图"
+CLIENT_INT_FILTER_GRAPH_DIRNAME: str = "整数过滤器节点图"
+CLIENT_BOOL_FILTER_GRAPH_DIRNAME: str = "布尔过滤器节点图"
+CLIENT_LEGACY_LOCAL_FILTER_GRAPH_DIRNAME: str = "本地过滤器节点图"
+
+CLIENT_GRAPH_START_NODE_TITLE: str = "节点图开始"
+CLIENT_GRAPH_END_INT_NODE_TITLE: str = "节点图结束（整数）"
+CLIENT_GRAPH_END_BOOL_NODE_TITLE: str = "节点图结束（布尔型）"
+
+
+def get_graph_category_from_folder_path(folder_path: str) -> str:
+    """从 metadata.folder_path 提取图分类目录名（如“技能节点图”）。"""
+    text = str(folder_path or "").strip()
+    if not text:
+        return ""
+    head = text.split("/", 1)[0].strip()
+    return head
+
+
+def get_builtin_anchor_titles_for_client_graph(*, folder_path: str) -> Tuple[str, ...]:
+    """返回当前 client 节点图类型在“新建时默认存在”的锚点节点标题集合。"""
+    category = get_graph_category_from_folder_path(folder_path)
+    if category == CLIENT_SKILL_GRAPH_DIRNAME:
+        return (CLIENT_GRAPH_START_NODE_TITLE,)
+    if category == CLIENT_INT_FILTER_GRAPH_DIRNAME:
+        return (CLIENT_GRAPH_END_INT_NODE_TITLE,)
+    if category in (CLIENT_BOOL_FILTER_GRAPH_DIRNAME, CLIENT_LEGACY_LOCAL_FILTER_GRAPH_DIRNAME):
+        return (CLIENT_GRAPH_END_BOOL_NODE_TITLE,)
+    return ()
+
+# 统一的“信号名”端口名称常量，供各层复用，避免直接使用硬编码字符串。
+SIGNAL_NAME_PORT_NAME: str = "信号名"
+
+# 常用数据端口名（集中定义，供引擎/校验/UI/工具复用）
+TARGET_ENTITY_PORT_NAME: str = "目标实体"
+VARIABLE_NAME_PORT_NAME: str = "变量名"
+
+# ----------------------------------------------------------------------------
+# 语义提示常量（仅用于引擎内部“语义推导 → 绑定落盘”的桥接）
+#
+# 说明：
+# - UI 与解析/IR 管线可以把“用户选择/可解析出的稳定 ID”写入到 node.input_constants 的隐藏键；
+# - `GraphSemanticPass` 会以这些隐藏键作为优先级最高的输入，统一生成 GraphModel.metadata 中的
+#   `signal_bindings/struct_bindings`（并负责向后兼容老数据）。
+# - 这些键名不对应任何真实端口，因此不会参与 Graph Code 生成的参数列表。
+# ----------------------------------------------------------------------------
+
+# 信号：稳定 signal_id 的语义提示键（node.input_constants[...]=<signal_id>）
+# 注意：该键名需与 `engine.graph.semantic.constants.SEMANTIC_SIGNAL_ID_CONSTANT_KEY` 保持一致。
+SIGNAL_ID_HINT_CONSTANT_KEY: str = "__signal_id"
+# 结构体：稳定 struct_id 的语义提示键（node.input_constants[...]=<struct_id>）
+# 注意：该键名需与 `engine.graph.semantic.constants.SEMANTIC_STRUCT_ID_CONSTANT_KEY` 保持一致。
+STRUCT_ID_HINT_CONSTANT_KEY: str = "__struct_id"
+
+# 发送信号节点的静态输入端口：
+# - 流程入：流程控制入口；
+# - 信号名：用于选择具体信号定义的选择端口（仅支持常量/行内编辑，不参与连线）。
+# 其余输入端口一律视为“信号参数端口”，必须来源于对应信号定义的参数列表。
+SIGNAL_SEND_STATIC_INPUTS: Tuple[str, ...] = ("流程入", SIGNAL_NAME_PORT_NAME)
+SIGNAL_LISTEN_STATIC_OUTPUTS: Tuple[str, ...] = ("流程出", "事件源实体", "事件源GUID", "信号来源实体")
+
+
+# 结构体节点标题与静态端口名（集中定义，便于 UI / 代码生成共享）
+STRUCT_SPLIT_NODE_TITLE: str = "拆分结构体"
+STRUCT_BUILD_NODE_TITLE: str = "拼装结构体"
+STRUCT_MODIFY_NODE_TITLE: str = "修改结构体"
+
+STRUCT_NODE_TITLES: Tuple[str, ...] = (
+    STRUCT_SPLIT_NODE_TITLE,
+    STRUCT_BUILD_NODE_TITLE,
+    STRUCT_MODIFY_NODE_TITLE,
+)
+
+# 结构体节点“唯一结构体端口”名称（统一约定）
+STRUCT_PORT_NAME: str = "结构体"
+
+# 旧端口名（仅用于兼容历史图/旧 Graph Code）
+STRUCT_PORT_LEGACY_INSTANCE_NAME: str = "结构体实例"
+STRUCT_PORT_LEGACY_BUILD_OUTPUT_NAME: str = "结果"
+
+# “结构体名”常量键（展示/兼容用）：
+# - 旧版本将其作为结构体节点的“选择端口”（不可连线）；新约定不再声明该输入端口，仅保留一个结构体端口；
+# - 结构体绑定的稳定锚点应写入 `node.input_constants["__struct_id"]`，并由 GraphSemanticPass 覆盖式生成 metadata["struct_bindings"]；
+# - 若需要在 UI/Graph Code 中展示绑定的结构体名称，可继续使用 `node.input_constants["结构体名"]` 作为展示常量（但它不再是端口）。
+STRUCT_NAME_PORT_NAME: str = "结构体名"
+
+# 静态端口合集：便于 UI 在追加动态端口时跳过这些固定入口/出口
+STRUCT_SPLIT_STATIC_INPUTS: Tuple[str, ...] = (STRUCT_PORT_NAME, STRUCT_PORT_LEGACY_INSTANCE_NAME)
+STRUCT_SPLIT_STATIC_OUTPUTS: Tuple[str, ...] = ()
+
+STRUCT_BUILD_STATIC_INPUTS: Tuple[str, ...] = ()
+STRUCT_BUILD_STATIC_OUTPUTS: Tuple[str, ...] = (STRUCT_PORT_NAME, STRUCT_PORT_LEGACY_BUILD_OUTPUT_NAME)
+
+STRUCT_MODIFY_STATIC_INPUTS: Tuple[str, ...] = ("流程入", STRUCT_PORT_NAME, STRUCT_PORT_LEGACY_INSTANCE_NAME)
+STRUCT_MODIFY_STATIC_OUTPUTS: Tuple[str, ...] = ("流程出",)
+
+
+# 选择端口判定（供 UI/自动化复用）
+def is_selection_input_port(node: Optional[Any], port_name: str) -> bool:
+    """
+    判断给定输入端口是否应视为“选择端口”（不可通过连线传入，只保留行内输入控件）。
+
+    约定（逐步扩展）：
+    - 【发送信号/监听信号】节点的“信号名”输入端口视为选择端口，只能通过信号选择对话框或行内编辑设置；
+      · 该端口不会出现在连线起点/终点的候选集合中；
+      · 仍作为普通数据输入参与代码生成，值来源于 `node.input_constants["信号名"]`。
+    - 结构体相关节点不再声明独立“结构体名”输入端口；结构体绑定通过隐藏常量 `__struct_id` 承载，
+      `metadata["struct_bindings"]` 由 `GraphSemanticPass` 覆盖式生成。
+    """
+    if node is None:
+        return False
+
+    title = getattr(node, "title", "") or ""
+    name = str(port_name or "")
+
+    # 信号相关节点：发送信号/监听信号 的“信号名”输入端口
+    if title in (SIGNAL_SEND_NODE_TITLE, SIGNAL_LISTEN_NODE_TITLE) and name == SIGNAL_NAME_PORT_NAME:
+        return True
+
+    return False
+
+
+# 静音布局调用：统一保存/恢复调试开关
+def apply_layout_quietly(
+    graph_model: GraphModel,
+    *,
+    node_library: Optional[dict] = None,
+    workspace_path: Optional["Path"] = None,
+    registry_context: Optional[object] = None,
+) -> None:
+    from engine.layout import LayoutService
+    from engine.configs.settings import settings
+    _old = settings.LAYOUT_DEBUG_PRINT
+    settings.LAYOUT_DEBUG_PRINT = False
+    LayoutService.compute_layout(
+        graph_model,
+        node_library=node_library,
+        clone_model=False,
+        workspace_path=workspace_path,
+        registry_context=registry_context,
+    )
+    settings.LAYOUT_DEBUG_PRINT = _old
+
+

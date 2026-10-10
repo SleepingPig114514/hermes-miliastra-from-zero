@@ -1,0 +1,16 @@
+/.vscode/
+/.VSCodeCounter/
+/node_modules/
+/test/
+/dist/
+.env
+
+temp/
+/utils/ref/
+/ref/
+/del/
+
+/*.cs
+/temp*.js
+/*.log
+/*.gia

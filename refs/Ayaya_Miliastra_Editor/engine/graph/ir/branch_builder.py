@@ -1,0 +1,495 @@
+"""分支节点构建器
+
+提供双分支（if-else）和多分支（match-case）的IR构建逻辑。
+"""
+from __future__ import annotations
+
+import ast
+import uuid
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
+
+from engine.graph.models import GraphModel, NodeModel, PortModel, EdgeModel, NodeDefRef
+from engine.nodes import get_canonical_node_def_key
+from .var_env import VarEnv
+from .validators import Validators
+from .node_factory import (
+    FactoryContext,
+    create_node_from_call,
+    extract_nested_nodes,
+    extract_constant_value,
+)
+from .edge_router import (
+    is_flow_node,
+    is_event_node,
+    create_data_edges_for_node_enhanced,
+    is_flow_port_ctx,
+)
+
+
+def _resolve_builtin_node_def_ref_by_title(title: str, *, ctx: FactoryContext) -> NodeDefRef:
+    title_text = str(title or "").strip()
+    full_key = ctx.node_name_index.get(title_text)
+    if not full_key:
+        raise ValueError(f"无法从 node_name_index 解析节点 key：{title_text}")
+    node_def = ctx.node_library.get(full_key)
+    if node_def is None:
+        raise KeyError(f"node_library 中未找到 NodeDef：{full_key}")
+    return NodeDefRef(kind="builtin", key=get_canonical_node_def_key(node_def))
+
+
+def extract_condition_variable(test_node: ast.expr) -> Optional[str]:
+    """从条件表达式中提取变量名"""
+    if isinstance(test_node, ast.Name):
+        return test_node.id
+    if isinstance(test_node, ast.UnaryOp) and isinstance(test_node.op, ast.Not):
+        return extract_condition_variable(test_node.operand)
+    if isinstance(test_node, ast.Compare):
+        if isinstance(test_node.left, ast.Name):
+            return test_node.left.id
+    return None
+
+
+def extract_match_subject(subject: ast.expr) -> Optional[str]:
+    """从match主题中提取变量名"""
+    if isinstance(subject, ast.Name):
+        return subject.id
+    return None
+
+
+def is_pass_only_block(body: List[ast.stmt]) -> bool:
+    """判断语句块是否只包含 pass（视为“空分支体”）
+
+    设计约定：
+    - 用于 match/case 等分支结构中，将『case X: pass』视为显式写出的“空体”；
+    - 这类分支在控制流图中不会生成新的节点，但对应的分支出口仍然可以继续向后接续。
+    """
+    if not body:
+        # match/case 在语法上通常不会出现完全空体，这里出于健壮性仍按“空体”处理
+        return True
+    return all(isinstance(stmt, ast.Pass) for stmt in body)
+
+
+def extract_case_value(pattern: ast.pattern) -> Any:
+    """从case模式中提取常量值"""
+    if isinstance(pattern, ast.MatchValue):
+        return extract_constant_value(pattern.value)
+    if isinstance(pattern, ast.MatchAs):
+        if pattern.name is None:
+            return "_"
+        return pattern.name
+    return None
+
+
+def _collect_assigned_names(body: List[ast.stmt]) -> Set[str]:
+    names: Set[str] = set()
+    for stmt in body:
+        for sub in ast.walk(stmt):
+            if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Store):
+                if sub.id:
+                    names.add(sub.id)
+    return names
+
+
+def block_has_return(body: List[ast.stmt]) -> bool:
+    """检查语句块是否包含“顶层 return”。
+
+    说明：
+    - 这里只把**直接出现在 body 列表中的 return 语句**视为“该分支体会终止并阻断后续接续”；
+    - 对于嵌套 return（例如位于 match/if 的某个子分支内），外层分支体仍可能在其它路径下继续执行，
+      不应因为“存在任意 return”而误判为整体不可接续。
+    """
+    for stmt in body:
+        if isinstance(stmt, ast.Return):
+            return True
+    return False
+
+
+def find_first_flow_node(nodes: List[NodeModel]) -> Optional[NodeModel]:
+    """查找列表中第一个流程节点"""
+    for node in nodes:
+        if is_flow_node(node):
+            return node
+    return None
+
+
+def find_last_flow_node(nodes: List[NodeModel]) -> Optional[NodeModel]:
+    """查找列表中最后一个流程节点"""
+    last: Optional[NodeModel] = None
+    for node in nodes:
+        if is_flow_node(node):
+            last = node
+    return last
+
+
+def create_dual_branch_node(
+    stmt: ast.If,
+    prev_flow_node: Optional[Union[NodeModel, List[Union[NodeModel, Tuple[NodeModel, str]]]]],
+    graph_model: GraphModel,
+    env: VarEnv,
+    ctx: FactoryContext,
+    validators: Validators,
+    parse_method_body_func,  # 避免循环导入
+) -> Tuple[Optional[NodeModel], List[NodeModel], List[EdgeModel], List[Union[NodeModel, Tuple[NodeModel, str]]]]:
+    """创建双分支节点（if-else）
+    
+    Args:
+        stmt: if语句AST节点
+        prev_flow_node: 前驱流程节点
+        graph_model: 图模型
+        env: 变量环境
+        ctx: 工厂上下文
+        validators: 验证器
+        parse_method_body_func: 解析方法体的函数（避免循环导入）
+        
+    Returns:
+        (分支节点, 所有子节点, 所有边, 分支出口节点列表)
+    """
+    branch_nodes: List[NodeModel] = []
+    branch_edges: List[EdgeModel] = []
+    branch_last_nodes: List[Union[NodeModel, Tuple[NodeModel, str]]] = []
+
+    condition_var = extract_condition_variable(stmt.test)
+
+    branch_node_id = f"node_双分支_{uuid.uuid4().hex[:8]}"
+    input_ports = [PortModel(name="流程入", is_input=True), PortModel(name="条件", is_input=True)]
+    output_ports = [PortModel(name="是", is_input=False), PortModel(name="否", is_input=False)]
+    branch_node = NodeModel(
+        id=branch_node_id,
+        title="双分支",
+        category="流程控制节点",
+        node_def_ref=_resolve_builtin_node_def_ref_by_title("双分支", ctx=ctx),
+        pos=(0.0, 0.0),
+        inputs=input_ports,
+        outputs=output_ports,
+    )
+    # 源码行号：来自 if 语句本身
+    branch_node.source_lineno = getattr(stmt, 'lineno', 0)
+    branch_node.source_end_lineno = getattr(stmt, 'end_lineno', getattr(stmt, 'lineno', 0))
+
+    # 条件输入连接
+    def _pick_first_data_output_port(node: NodeModel) -> Optional[str]:
+        for output_port in node.outputs:
+            if not is_flow_port_ctx(node, output_port.name, True):
+                return output_port.name
+        return None
+
+    def _connect_condition_source_to_branch(src_node_id: str, src_port: str) -> None:
+        branch_edges.append(
+            EdgeModel(
+                id=str(uuid.uuid4()),
+                src_node=src_node_id,
+                src_port=src_port,
+                dst_node=branch_node_id,
+                dst_port="条件",
+            )
+        )
+
+    def _materialize_boolean_expr(expr: ast.expr) -> Tuple[Optional[str], Optional[str]]:
+        """将布尔表达式建模为节点/变量输出，并返回 (src_node_id, src_port_name)。"""
+        if isinstance(expr, ast.Name):
+            source = env.get_variable(expr.id)
+            if source:
+                return source[0], source[1]
+            return None, None
+        if isinstance(expr, ast.Call):
+            nested_nodes, nested_edges, param_node_map = extract_nested_nodes(
+                expr,
+                ctx,
+                validators,
+                env,
+                graph_model=graph_model,
+            )
+            branch_nodes.extend(nested_nodes)
+            branch_edges.extend(nested_edges)
+            cond_node = create_node_from_call(expr, ctx, validators, env=env, graph_model=graph_model)
+            if not cond_node:
+                return None, None
+            branch_nodes.append(cond_node)
+            data_edges = create_data_edges_for_node_enhanced(
+                cond_node,
+                expr,
+                param_node_map,
+                ctx.node_library,
+                ctx.node_name_index,
+                env,
+                graph_model=graph_model,
+            )
+            branch_edges.extend(data_edges)
+            cond_out = _pick_first_data_output_port(cond_node)
+            if cond_out:
+                return cond_node.id, cond_out
+            return None, None
+        return None, None
+
+    if isinstance(stmt.test, ast.UnaryOp) and isinstance(stmt.test.op, ast.Not):
+        operand_expr = stmt.test.operand
+        operand_src_node_id, operand_src_port = _materialize_boolean_expr(operand_expr)
+
+        logic_not_call = ast.Call(
+            func=ast.Name(id="逻辑非运算", ctx=ast.Load()),
+            args=[],
+            keywords=[ast.keyword(arg="输入", value=ast.Name(id="_条件", ctx=ast.Load()))],
+        )
+        logic_not_call.lineno = getattr(stmt.test, "lineno", 0)
+        logic_not_call.end_lineno = getattr(stmt.test, "end_lineno", getattr(stmt.test, "lineno", 0))
+        not_node = create_node_from_call(logic_not_call, ctx, validators, env=env, graph_model=graph_model)
+        if not_node:
+            # 确保源码行号可追踪到 if 条件
+            not_node.source_lineno = getattr(stmt.test, "lineno", 0)
+            not_node.source_end_lineno = getattr(stmt.test, "end_lineno", getattr(stmt.test, "lineno", 0))
+            branch_nodes.append(not_node)
+
+            not_input_port: Optional[str] = None
+            for input_port in not_node.inputs:
+                if not is_flow_port_ctx(not_node, input_port.name, False):
+                    not_input_port = input_port.name
+                    break
+            not_output_port = _pick_first_data_output_port(not_node)
+
+            if operand_src_node_id and operand_src_port and not_input_port:
+                branch_edges.append(
+                    EdgeModel(
+                    id=str(uuid.uuid4()),
+                        src_node=operand_src_node_id,
+                        src_port=operand_src_port,
+                        dst_node=not_node.id,
+                        dst_port=not_input_port,
+                    )
+                )
+            if not_output_port:
+                _connect_condition_source_to_branch(not_node.id, not_output_port)
+    else:
+        if condition_var:
+            source = env.get_variable(condition_var)
+            if source:
+                _connect_condition_source_to_branch(source[0], source[1])
+        elif isinstance(stmt.test, ast.Call):
+            cond_src_node_id, cond_src_port = _materialize_boolean_expr(stmt.test)
+            if cond_src_node_id and cond_src_port:
+                _connect_condition_source_to_branch(cond_src_node_id, cond_src_port)
+
+    # 是分支体
+    if stmt.body:
+        snapshot = env.snapshot()
+        assigned_true = _collect_assigned_names(stmt.body)
+        assigned_false = _collect_assigned_names(stmt.orelse) if stmt.orelse else set()
+        # 只有在多个分支中都被赋值的变量才需要标记为多分支赋值候选，
+        # 避免为只在单一分支中赋值并使用的变量创建不必要的局部变量节点
+        combined_assigned = assigned_true & assigned_false
+        env.push_multi_assign(combined_assigned)
+        true_nodes, true_edges, true_final_prev = parse_method_body_func(stmt.body, (branch_node, "是"), graph_model, False, env, ctx, validators)
+        env.pop_multi_assign()
+        branch_nodes.extend(true_nodes)
+        branch_edges.extend(true_edges)
+
+        # 检测该分支是否包含 break（仅当处于循环体内时才有意义）
+        has_break_true: bool = False
+        if getattr(env, "loop_stack", None):
+            loop_node_obj = env.loop_stack[-1] if env.loop_stack else None
+            if loop_node_obj:
+                loop_id = getattr(loop_node_obj, "id", "")
+                for _e in true_edges:
+                    if _e.dst_node == loop_id and _e.dst_port == "跳出循环":
+                        has_break_true = True
+                        break
+
+        # 利用 parse_method_body 返回的精确续接信息确定分支出口，
+        # 而不是用 find_last_flow_node 猜测——后者对嵌套分支节点无法
+        # 区分哪个输出端口可以续接（例如内层双分支的"是"可续接、"否"走了 return）。
+        has_ret = block_has_return(stmt.body)
+        if (not has_ret) and (not has_break_true):
+            if true_final_prev is not None:
+                if isinstance(true_final_prev, list):
+                    branch_last_nodes.extend(true_final_prev)
+                else:
+                    branch_last_nodes.append(true_final_prev)
+            # true_final_prev 为 None → 分支体内所有路径均已终止（如嵌套 if 全部 return），不可续接
+        env.restore(snapshot)
+    else:
+        # 空分支体：仅当未出现 break 时才允许从“是”继续向后接续
+        has_break_true = False
+        # 空体不可能产出 true_edges；但为了一致性，仍按照“未检测到break”处理
+        if not block_has_return(stmt.body) and (not has_break_true):
+            branch_last_nodes.append((branch_node, "是"))
+
+    # 否分支体
+    if stmt.orelse:
+        snapshot = env.snapshot()
+        assigned_true = _collect_assigned_names(stmt.body) if stmt.body else set()
+        assigned_false = _collect_assigned_names(stmt.orelse)
+        # 只有在多个分支中都被赋值的变量才需要标记为多分支赋值候选
+        combined_assigned = assigned_true & assigned_false
+        env.push_multi_assign(combined_assigned)
+        false_nodes, false_edges, false_final_prev = parse_method_body_func(stmt.orelse, (branch_node, "否"), graph_model, False, env, ctx, validators)
+        env.pop_multi_assign()
+        branch_nodes.extend(false_nodes)
+        branch_edges.extend(false_edges)
+
+        # 检测该分支是否包含 break（仅当处于循环体内时才有意义）
+        has_break_false: bool = False
+        if getattr(env, "loop_stack", None):
+            loop_node_obj = env.loop_stack[-1] if env.loop_stack else None
+            if loop_node_obj:
+                loop_id = getattr(loop_node_obj, "id", "")
+                for _e in false_edges:
+                    if _e.dst_node == loop_id and _e.dst_port == "跳出循环":
+                        has_break_false = True
+                        break
+
+        # 利用 parse_method_body 返回的精确续接信息（同"是"分支逻辑）
+        has_ret2 = block_has_return(stmt.orelse)
+        if (not has_ret2) and (not has_break_false):
+            if false_final_prev is not None:
+                if isinstance(false_final_prev, list):
+                    branch_last_nodes.extend(false_final_prev)
+                else:
+                    branch_last_nodes.append(false_final_prev)
+            # false_final_prev 为 None → 分支体内所有路径均已终止，不可续接
+        env.restore(snapshot)
+    else:
+        # 空分支体：允许从“否”接续（该分支无 break）
+        branch_last_nodes.append((branch_node, "否"))
+
+    return branch_node, branch_nodes, branch_edges, branch_last_nodes
+
+
+def create_multi_branch_node(
+    stmt: ast.Match,
+    prev_flow_node: Optional[Union[NodeModel, List[Union[NodeModel, Tuple[NodeModel, str]]]]],
+    graph_model: GraphModel,
+    env: VarEnv,
+    ctx: FactoryContext,
+    validators: Validators,
+    parse_method_body_func,  # 避免循环导入
+) -> Tuple[
+    Optional[NodeModel],
+    List[NodeModel],
+    List[EdgeModel],
+    List[Union[NodeModel, Tuple[NodeModel, str]]],
+]:
+    """创建多分支节点（match-case）
+    
+    Args:
+        stmt: match语句AST节点
+        prev_flow_node: 前驱流程节点
+        graph_model: 图模型
+        env: 变量环境
+        ctx: 工厂上下文
+        validators: 验证器
+        parse_method_body_func: 解析方法体的函数（避免循环导入）
+        
+    Returns:
+        (分支节点, 所有子节点, 所有边, 分支出口节点列表)
+    """
+    branch_nodes: List[NodeModel] = []
+    branch_edges: List[EdgeModel] = []
+    # 分支出口集合：
+    # - 对于非空分支体：记录该分支体中的“最后一个流程节点”；
+    # - 对于仅包含 pass 的分支体：记录 (多分支节点, 对应分支端口名)，表示从该端口可直接接续到后续语句。
+    branch_last_nodes: List[Union[NodeModel, Tuple[NodeModel, str]]] = []
+
+    control_var = extract_match_subject(stmt.subject)
+    branch_node_id = f"node_多分支_{uuid.uuid4().hex[:8]}"
+
+    input_ports = [
+        PortModel(name="流程入", is_input=True),
+        PortModel(name="控制表达式", is_input=True),
+    ]
+
+    output_ports = [PortModel(name="默认", is_input=False)]
+    case_values: List[Any] = []
+    for case in stmt.cases:
+        case_value = extract_case_value(case.pattern)
+        if case_value is not None and case_value != "_":
+            case_values.append(case_value)
+            output_ports.append(PortModel(name=str(case_value), is_input=False))
+
+    # 校验（仅记录，不中断）
+    if case_values:
+        found_int = any(isinstance(v, int) for v in case_values)
+        found_str = any(isinstance(v, str) for v in case_values)
+        has_unsupported = any((not isinstance(v, int)) and (not isinstance(v, str)) for v in case_values)
+        if has_unsupported:
+            validators.error("多分支仅支持整数或字符串作为分支值；该写法无法可靠解析为节点图语义")
+        if found_int and found_str:
+            validators.error("多分支的所有 case 值必须同为整数或同为字符串；混用会导致节点图语义不确定")
+
+    branch_node = NodeModel(
+        id=branch_node_id,
+        title="多分支",
+        category="流程控制节点",
+        node_def_ref=_resolve_builtin_node_def_ref_by_title("多分支", ctx=ctx),
+        pos=(0.0, 0.0),
+        inputs=input_ports,
+        outputs=output_ports,
+    )
+    # 源码行号：来自 match 语句本身
+    branch_node.source_lineno = getattr(stmt, 'lineno', 0)
+    branch_node.source_end_lineno = getattr(stmt, 'end_lineno', getattr(stmt, 'lineno', 0))
+
+    if control_var:
+        src = env.get_variable(control_var)
+        if src:
+            src_node_id, src_port = src
+            branch_edges.append(EdgeModel(
+                id=str(uuid.uuid4()),
+                src_node=src_node_id,
+                src_port=src_port,
+                dst_node=branch_node_id,
+                dst_port="控制表达式",
+            ))
+
+    # 只有在多个分支中都被赋值的变量才需要标记为多分支赋值候选，
+    # 用交集来确定哪些变量在所有分支中都被赋值
+    all_case_assigned = [_collect_assigned_names(case.body) for case in stmt.cases]
+    if len(all_case_assigned) > 1:
+        combined_assigned: Set[str] = all_case_assigned[0].copy()
+        for other_assigned in all_case_assigned[1:]:
+            combined_assigned &= other_assigned
+    else:
+        combined_assigned = set()
+
+    for case in stmt.cases:
+        case_value = extract_case_value(case.pattern)
+        branch_port = "默认" if case_value in ("_", None) else str(case_value)
+        snapshot = env.snapshot()
+        env.push_multi_assign(combined_assigned)
+        case_nodes, case_edges, case_final_prev = parse_method_body_func(
+            case.body,
+            (branch_node, branch_port),
+            graph_model,
+            False,
+            env,
+            ctx,
+            validators,
+        )
+        env.pop_multi_assign()
+        branch_nodes.extend(case_nodes)
+        branch_edges.extend(case_edges)
+
+        # 检测该分支是否包含 break（仅当处于循环体内时才有意义）
+        has_break_case: bool = False
+        if getattr(env, "loop_stack", None):
+            loop_node_obj = env.loop_stack[-1] if env.loop_stack else None
+            if loop_node_obj is not None:
+                loop_id = getattr(loop_node_obj, "id", "")
+                for edge in case_edges:
+                    if edge.dst_node == loop_id and edge.dst_port == "跳出循环":
+                        has_break_case = True
+                        break
+
+        # 利用 parse_method_body 返回的精确续接信息（与双分支逻辑一致）
+        has_ret = block_has_return(case.body)
+        if (not has_ret) and (not has_break_case):
+            if case_final_prev is not None:
+                if isinstance(case_final_prev, list):
+                    branch_last_nodes.extend(case_final_prev)
+                else:
+                    branch_last_nodes.append(case_final_prev)
+
+        env.restore(snapshot)
+
+    return branch_node, branch_nodes, branch_edges, branch_last_nodes
+
+
+

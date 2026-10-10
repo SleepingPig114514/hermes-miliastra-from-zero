@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>GIA / GIL Splitter</title>
+  <meta name="description" content="Split a .gia model's Decoration entries into new models, or pull a .gil level's attached decorations out into standalone world objects. Runs in your browser, nothing is uploaded.">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='0.9em' font-size='90'>✂️</text></svg>">
+  <link rel="stylesheet" href="css/style.css">
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+    }
+  }
+  </script>
+</head>
+<body>
+  <div id="app">
+    <header id="topbar">
+      <div class="brand">
+        <div class="brand-mark">✂</div>
+        <div class="brand-text">GIA·GIL<span>Splitter</span></div>
+        <div class="brand-tag" data-i18n="brand.tag"></div>
+      </div>
+      <div id="file-meta" class="file-meta hidden">
+        <span id="meta-name" class="meta-name"></span>
+        <span id="meta-stats" class="meta-stats"></span>
+      </div>
+      <div class="topbar-actions">
+        <div class="lang-wrap" data-i18n-title="lang.label">
+          <span class="lang-icon" aria-hidden="true">🌐</span>
+          <select id="lang-select" aria-label="Language"></select>
+        </div>
+        <button id="btn-open" class="btn ghost" data-i18n="topbar.open"></button>
+        <input type="file" id="file-input" accept=".gia,.gil" hidden>
+      </div>
+    </header>
+
+    <main id="main">
+
+      <div id="dropzone">
+        <div class="drop-card">
+          <div class="drop-icon">✂</div>
+          <h1>GIA / GIL Splitter</h1>
+          <p class="hero-formats">
+            <span class="fmt-line"><span class="fmt-tag">.gia</span> <span data-i18n="hero.lead"></span></span>
+            <span class="fmt-line"><span class="fmt-tag">.gil</span> <span data-i18n="hero.lead2"></span></span>
+          </p>
+          <p><strong data-i18n="hero.preserve"></strong></p>
+          <button id="btn-open-hero" class="btn primary big" data-i18n="hero.choose"></button>
+          <p class="hint"><span data-i18n="hero.drop1"></span><br><span data-i18n="hero.paste"></span><br><span data-i18n="hero.drop2"></span></p>
+        </div>
+      </div>
+
+      <div id="workbench" class="hidden">
+
+        <aside id="model-panel">
+          <div class="panel-head">
+            <h2 data-i18n="models.title" data-i18n-gil="gil.objects.title"></h2>
+            <span id="model-count" class="pill"></span>
+          </div>
+          <div class="model-toolbar">
+            <button id="btn-models-all" class="btn tiny" data-i18n="models.selectAll"></button>
+            <button id="btn-models-none" class="btn tiny" data-i18n="models.deselectAll"></button>
+            <span id="export-count" class="export-count gia-only"></span>
+            <select id="obj-sort" class="v-select gil-only">
+              <option value="deco" data-i18n="gil.sort.deco"></option>
+              <option value="name" data-i18n="gil.sort.name"></option>
+              <option value="id" data-i18n="gil.sort.id"></option>
+              <option value="prefab" data-i18n="gil.sort.prefab"></option>
+            </select>
+          </div>
+          <div class="model-toolbar gil-only">
+            <input type="search" id="obj-search" data-i18n-placeholder="gil.search" autocomplete="off">
+            <label class="opt-label"><input type="checkbox" id="obj-show-all"> <span data-i18n="gil.showAll"></span></label>
+          </div>
+          <div id="model-list"></div>
+          <p class="hint panel-hint gia-only" data-i18n="models.hint"></p>
+        </aside>
+
+        <div class="vsplit" data-panel="models"></div>
+
+        <section id="detail-panel">
+          <div id="detail-head">
+            <div class="detail-title">
+              <h3 id="detail-name"></h3>
+              <span id="detail-count" class="pill"></span>
+            </div>
+            <div class="detail-actions">
+              <button id="btn-select-all" class="btn tiny" data-i18n="detail.selectAll"></button>
+              <button id="btn-select-none" class="btn tiny" data-i18n="detail.clear"></button>
+              <button id="btn-move-up" class="btn tiny move gia-only" data-i18n-title="reorder.up" disabled>▲</button>
+              <button id="btn-move-down" class="btn tiny move gia-only" data-i18n-title="reorder.down" disabled>▼</button>
+              <button id="btn-rename-sel" class="btn tiny" data-i18n="rename.selected" disabled></button>
+              <div id="rename-pop" class="rename-pop hidden">
+                <input type="text" id="rename-pop-input" spellcheck="false">
+              </div>
+            </div>
+          </div>
+
+          <div id="split-bar" class="gia-only">
+            <span id="split-info" class="split-info"></span>
+            <button id="btn-split" class="btn primary" disabled></button>
+          </div>
+
+          <div id="group-bar">
+            <span id="group-info" class="split-info"></span>
+            <button id="btn-ungroup-all" class="btn ghost" data-i18n="group.all" data-i18n-title="group.allTip"></button>
+            <button id="btn-ungroup-sel" class="btn primary" disabled></button>
+          </div>
+
+          <fieldset id="gil-ops" class="gil-only">
+            <legend data-i18n="gil.panel.extraction"></legend>
+            <div class="gil-ops-row">
+              <span id="gil-op-info" class="split-info"></span>
+              <button id="btn-gil-undo" class="btn ghost tiny" data-i18n="gil.btn.undo" disabled></button>
+              <button id="btn-gil-redo" class="btn ghost tiny" data-i18n="gil.btn.redo" disabled></button>
+            </div>
+            <div class="gil-actions-row">
+              <button id="btn-gil-split-sel" class="btn primary" data-i18n="gil.btn.splitSel" disabled></button>
+              <button id="btn-gil-split-parents" class="btn primary" data-i18n="gil.btn.splitParents" disabled></button>
+            </div>
+            <div class="gil-opts-row">
+              <label class="opt-label" data-i18n-title="gil.opt.collisionTip"><input type="checkbox" id="gil-opt-collision"> <span data-i18n="gil.opt.collision"></span></label>
+              <label class="opt-label" data-i18n-title="gil.opt.removeParentTip"><input type="checkbox" id="gil-opt-remove-parent"> <span data-i18n="gil.opt.removeParent"></span></label>
+            </div>
+          </fieldset>
+
+          <fieldset id="gil-export" class="gil-only">
+            <legend data-i18n="gil.panel.exportGia"></legend>
+            <div class="gil-ops-row">
+              <span id="gil-export-info" class="split-info"></span>
+              <button id="btn-gil-export-gia" class="btn primary" data-i18n="gil.btn.exportGia" disabled></button>
+            </div>
+          </fieldset>
+
+          <div id="dec-table-wrap">
+            <table id="dec-table">
+              <thead>
+                <tr>
+                  <th class="col-drag"></th>
+                  <th class="col-check"></th>
+                  <th class="num col-idx">#</th>
+                  <th data-i18n="table.name" data-sort="name"></th>
+                  <th class="num" data-i18n="table.id" data-sort="id"></th>
+                  <th class="num gil-only" data-i18n="gil.col.prefab" data-i18n-title="gil.col.prefabTip" data-sort="prefab"></th>
+                  <th class="gil-only" data-i18n="gil.col.collision" data-sort="coll"></th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+            <p class="hint table-hint gia-only dec-hint" data-i18n="table.hint"></p>
+            <p class="hint table-hint gia-only dec-hint" data-i18n="reorder.hint"></p>
+            <p class="hint table-hint group-hint" data-i18n="group.hint" data-i18n-gil="gil.group.hint"></p>
+            <p class="hint table-hint gil-only" data-i18n="gil.table.hint"></p>
+          </div>
+        </section>
+
+        <div class="vsplit" data-panel="viewer"></div>
+
+        <section id="viewer-panel">
+          <div id="viewer-toolbar">
+            <input type="search" id="v-search" data-i18n-placeholder="viewer.search" autocomplete="off">
+            <span id="v-stats" class="v-stats"></span>
+            <span id="v-coords" class="v-coords"></span>
+          </div>
+          <div id="viewer-tools">
+            <button id="v-frame-sel" class="btn tiny" data-i18n-title="viewer.frameSel">⊡</button>
+            <button id="v-frame-all" class="btn tiny" data-i18n-title="viewer.frameAll">⛶</button>
+            <button id="v-grid" class="btn tiny on" data-i18n-title="viewer.grid">▦</button>
+            <button id="v-axes" class="btn tiny on" data-i18n-title="viewer.axes">⚹</button>
+            <select id="v-labels" class="v-select" data-i18n-title="viewer.labels">
+              <option value="off" data-i18n="viewer.labelsOff"></option>
+              <option value="name" data-i18n="viewer.labelsName"></option>
+              <option value="index" data-i18n="viewer.labelsIndex"></option>
+            </select>
+            <input type="range" id="v-size" min="3" max="16" step="1" value="7" data-i18n-title="viewer.pointSize">
+            <input type="color" id="v-color-sel" value="#39d0d8" data-i18n-title="viewer.colorSel">
+            <input type="color" id="v-color-unsel" value="#7d879c" data-i18n-title="viewer.colorUnsel">
+            <button id="v-hide-sel" class="btn tiny" data-i18n="viewer.hideSel"></button>
+            <button id="v-hide-unsel" class="btn tiny" data-i18n="viewer.hideUnsel"></button>
+            <button id="v-isolate" class="btn tiny" data-i18n="viewer.isolate"></button>
+            <button id="v-show-all" class="btn tiny" data-i18n="viewer.showAll"></button>
+          </div>
+          <div id="v-viewport">
+            <div class="quickview">
+              <button class="btn tiny" data-view="home">⌂</button>
+              <button class="btn tiny" data-view="px">+X</button>
+              <button class="btn tiny" data-view="nx">−X</button>
+              <button class="btn tiny" data-view="py">+Y</button>
+              <button class="btn tiny" data-view="ny">−Y</button>
+              <button class="btn tiny" data-view="pz">+Z</button>
+              <button class="btn tiny" data-view="nz">−Z</button>
+            </div>
+          </div>
+          <p class="hint viewer-hint" data-i18n="viewer.hint"></p>
+        </section>
+
+      </div>
+    </main>
+
+    <footer id="export-bar" class="hidden">
+      <div class="export-summary">
+        <div class="chip"><b id="ex-models"></b><span data-i18n="export.models" data-i18n-gil="gil.objects.title"></span></div>
+        <div class="chip gia-only"><b id="ex-selected"></b><span data-i18n="export.exported"></span></div>
+        <div class="chip"><b id="ex-splits"></b><span data-i18n="export.splits" data-i18n-gil="gil.st.edits"></span></div>
+        <div class="chip"><b id="ex-size"></b><span data-i18n="export.size"></span></div>
+      </div>
+      <div class="export-name">
+        <label for="set-name" class="export-label" data-i18n="export.nameLabel"></label>
+        <input type="text" id="set-name" spellcheck="false">
+      </div>
+      <div class="export-actions">
+        <button id="btn-reset" class="btn ghost" data-i18n="export.reset" data-i18n-title="export.resetTip"></button>
+        <button id="btn-download" class="btn primary"></button>
+      </div>
+    </footer>
+  </div>
+
+  <div id="toast" class="toast hidden"></div>
+
+  <dialog id="confirm-modal" class="modal">
+    <h3 id="cm-head"></h3>
+    <div id="cm-body" class="modal-body"></div>
+    <div class="modal-actions">
+      <button id="cm-cancel" class="btn ghost" data-i18n="gil.btn.cancel"></button>
+      <button id="cm-ok" class="btn primary" data-i18n="gil.btn.continue"></button>
+    </div>
+  </dialog>
+
+  <dialog id="error-modal" class="modal">
+    <h3 data-i18n="gil.dlg.problem"></h3>
+    <div id="em-body" class="modal-body"></div>
+    <div class="modal-actions">
+      <button id="em-close" class="btn primary" data-i18n="gil.btn.close"></button>
+    </div>
+  </dialog>
+
+  <div id="progress-overlay" class="hidden">
+    <div class="progress-card">
+      <div id="progress-label" class="progress-label"></div>
+      <div class="progress-track"><div id="progress-bar"></div></div>
+    </div>
+  </div>
+
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>

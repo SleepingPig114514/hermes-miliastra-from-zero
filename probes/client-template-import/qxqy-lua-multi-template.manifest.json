@@ -1,0 +1,201 @@
+{
+  "generatedAt": "2026-10-10T00:31:00.707Z",
+  "sha256": "ae58bf266faf228c8d78cc03b344737bd2aa5f8a1e7be00126ca906285dc5126",
+  "bytes": 3961,
+  "prefabIds": [
+    1073742100,
+    1073742102,
+    1073742103
+  ],
+  "templateNames": [
+    "Lua实例化面板",
+    "模板图标",
+    "确认按钮"
+  ],
+  "structure": {
+    "gameVersion": "7.0.50",
+    "graphName": "Lua实例化面板",
+    "accessories": 2,
+    "assetType": "client-control-template",
+    "templateCount": 3
+  },
+  "compatibility": {
+    "valid": true,
+    "errors": [],
+    "filePath": "114514-1791592260-1073741830-\\qxqy-lua-multi-template.gia",
+    "gameVersion": "7.0.50",
+    "templateCount": 3,
+    "accessoryCount": 2,
+    "templates": [
+      {
+        "id": 1073742100,
+        "name": "Lua实例化面板",
+        "kind": "container",
+        "actualIndex": 2,
+        "expectedIndex": 2,
+        "relatedPresent": true,
+        "relatedGuids": []
+      },
+      {
+        "id": 1073742102,
+        "name": "模板图标",
+        "kind": "image",
+        "actualIndex": 10,
+        "expectedIndex": 10,
+        "relatedPresent": true,
+        "relatedGuids": []
+      },
+      {
+        "id": 1073742103,
+        "name": "确认按钮",
+        "kind": "button",
+        "actualIndex": 7,
+        "expectedIndex": 7,
+        "relatedPresent": true,
+        "relatedGuids": []
+      }
+    ],
+    "units": [
+      {
+        "id": 1073742100,
+        "name": "Lua实例化面板",
+        "kind": "container",
+        "template": true,
+        "parent": 0,
+        "children": [
+          1073742101
+        ],
+        "relatedIds": [
+          1073742101
+        ],
+        "dataSignatures": [
+          "2/15",
+          "4/86",
+          "1/12",
+          "63/83",
+          "68/91",
+          "67/90"
+        ]
+      },
+      {
+        "id": 1073742102,
+        "name": "模板图标",
+        "kind": "image",
+        "template": true,
+        "parent": 0,
+        "children": [],
+        "relatedIds": [],
+        "dataSignatures": [
+          "2/15",
+          "4/86",
+          "1/12",
+          "63/83",
+          "73/96",
+          "74/97",
+          "67/90"
+        ]
+      },
+      {
+        "id": 1073742103,
+        "name": "确认按钮",
+        "kind": "button",
+        "template": true,
+        "parent": 0,
+        "children": [
+          1073742104
+        ],
+        "relatedIds": [
+          1073742104
+        ],
+        "dataSignatures": [
+          "2/15",
+          "4/86",
+          "1/12",
+          "63/83",
+          "70/93",
+          "67/90"
+        ]
+      },
+      {
+        "id": 1073742101,
+        "name": "模板标题",
+        "kind": "textbox",
+        "template": false,
+        "parent": 1073742100,
+        "children": [],
+        "relatedIds": [],
+        "dataSignatures": [
+          "2/15",
+          "4/86",
+          "1/12",
+          "63/83",
+          "64/84",
+          "67/90"
+        ]
+      },
+      {
+        "id": 1073742104,
+        "name": "按钮文字",
+        "kind": "textbox",
+        "template": false,
+        "parent": 1073742103,
+        "children": [],
+        "relatedIds": [],
+        "dataSignatures": [
+          "2/15",
+          "4/86",
+          "1/12",
+          "63/83",
+          "64/84",
+          "67/90"
+        ]
+      }
+    ],
+    "explicitEmpty": {
+      "field17": 10,
+      "rectField508": 20
+    }
+  },
+  "controls": [
+    {
+      "id": "n1001",
+      "name": "Lua实例化面板",
+      "kind": "container",
+      "depth": 0,
+      "parentId": null
+    },
+    {
+      "id": "n1004",
+      "name": "模板标题",
+      "kind": "textbox",
+      "depth": 1,
+      "parentId": "n1001"
+    },
+    {
+      "id": "n1002",
+      "name": "模板图标",
+      "kind": "image",
+      "depth": 0,
+      "parentId": null
+    },
+    {
+      "id": "n1003",
+      "name": "确认按钮",
+      "kind": "button",
+      "depth": 0,
+      "parentId": null
+    },
+    {
+      "id": "n1005",
+      "name": "按钮文字",
+      "kind": "textbox",
+      "depth": 1,
+      "parentId": "n1003"
+    }
+  ],
+  "warnings": [
+    "Lua实例化面板: 新客户端控件模板写入显式空 Info.related，避免跨沙箱复用伴生资源 GUID 产生无法加载的索引。",
+    "模板图标: 新客户端控件模板写入显式空 Info.related，避免跨沙箱复用伴生资源 GUID 产生无法加载的索引。",
+    "确认按钮: 新客户端控件模板写入显式空 Info.related，避免跨沙箱复用伴生资源 GUID 产生无法加载的索引。"
+  ]
+}

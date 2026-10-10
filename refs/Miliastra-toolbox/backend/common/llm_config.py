@@ -1,0 +1,83 @@
+"""公用 LLM 配置解析
+
+提供 resolve_llm_config() 供 chatEngine 和 agentEngine 统一使用。
+"""
+import os
+from typing import Dict, Any
+
+from .pg_client import model_usage_manager
+
+# ── 渠道配置表 ──────────────────────────────────────────────
+_CHANNEL_ENV: dict[int, tuple[str, str, str]] = {
+    2: ("DEFAULT_FREE_MODEL_KEY2", "DEFAULT_FREE_MODEL_URL2", "DEFAULT_FREE_MODEL_NAME2"),
+    3: ("DEFAULT_FREE_MODEL_KEY3", "DEFAULT_FREE_MODEL_URL3", "DEFAULT_FREE_MODEL_NAME3"),
+    4: ("DEFAULT_FREE_MODEL_KEY3", "DEFAULT_FREE_MODEL_URL3", "DEFAULT_FREE_MODEL_NAME4"),
+}
+
+
+def format_llm_error(err: Exception) -> str:
+    """将 LLM/上游 API 异常格式化为面向用户的详细错误信息。
+
+    覆盖常见情形：
+    - 后端每日限额 ValueError：str(err) 已含中文说明，原样返回。
+    - OpenAI 兼容 SDK 的 APIStatusError：提取 status_code、body、message。
+    - 其他异常：回退到 str(err)。
+    """
+    msg = str(err).strip()
+    status = getattr(err, "status_code", None)
+    body = getattr(err, "body", None)
+    api_message = getattr(err, "message", None)
+
+    parts: list[str] = []
+    if status:
+        parts.append(f"HTTP {status}")
+    if api_message and api_message not in msg:
+        parts.append(str(api_message))
+    if body:
+        if isinstance(body, dict):
+            # OpenAI 风格：{"error": {"message": "...", "type": "..."}}
+            inner = body.get("error") if isinstance(body.get("error"), dict) else body
+            detail = inner.get("message") or inner.get("detail") or ""
+            if detail and detail not in msg:
+                parts.append(str(detail))
+        elif isinstance(body, str) and body not in msg:
+            parts.append(body)
+
+    if parts:
+        return f"{msg}（{' | '.join(parts)}）" if msg else " | ".join(parts)
+    return msg or err.__class__.__name__
+
+
+def resolve_llm_config(config: Dict[str, Any]) -> Dict[str, str | int]:
+    """解析 LLM 配置，返回 {api_key, api_base_url, model, channel_id}
+
+    所有渠道 1-4 均记录用量（渠道 1/2 同时强制每日限额，
+    """
+    ch = config.get("use_default_model", 0)
+
+    if ch in (1, 2, 3, 4):
+        quota = model_usage_manager.check_and_increment(ch)
+        if not quota["allowed"]:
+            raise ValueError(
+                f"渠道 {ch} 已达每日限额 {quota['limit']} 次，"
+                f"当前使用 {quota['usage']} 次，请明天再试或在 LLM 配置自行提供模型API服务/使用其他免费渠道"
+            )
+        if quota["limit"] != -1:
+            print(f"[LLMConfig] 渠道 {ch} 用量: {quota['usage']}/{quota['limit']}，"
+                  f"剩余 {quota['remaining']} 次")
+
+        if ch == 1:
+            return {"api_key": os.getenv("DEFAULT_FREE_MODEL_KEY", ""),
+                    "api_base_url": os.getenv("DEFAULT_FREE_MODEL_URL", ""),
+                    "model": os.getenv("DEFAULT_FREE_MODEL_NAME", ""), "channel_id": ch}
+
+        key_env, url_env, model_env = _CHANNEL_ENV[ch]
+
+        return {"api_key": os.getenv(key_env, ""), "api_base_url": os.getenv(url_env, ""),
+                "model": os.getenv(model_env, ""), "channel_id": ch}
+
+    if all(config.get(k, "").strip() for k in ("api_key", "api_base_url", "model")):
+        return {"api_key": config["api_key"], "api_base_url": config["api_base_url"],
+                "model": config["model"], "channel_id": 0}
+
+    raise ValueError("未提供有效的 API 配置，请完整配置 API Key、Base URL、Model，或启用默认免费模型")

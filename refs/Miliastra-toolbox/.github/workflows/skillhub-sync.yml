@@ -1,0 +1,41 @@
+name: Sync SkillHub
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'skills/**'
+  workflow_dispatch:
+
+jobs:
+  sync-skillhub:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install SkillHub CLI
+        run: |
+          curl -fsSL https://skillhub.cn/install/install.sh | bash -s -- --cli-only
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Login to SkillHub
+        env:
+          SKILLHUB_TOKEN: ${{ secrets.SKILLHUB_TOKEN }}
+        run: |
+          set -e
+          skillhub login \
+            --key "$SKILLHUB_TOKEN" \
+            --host https://api.skillhub.cn
+          skillhub auth whoami
+
+      - name: Publish skills to SkillHub
+        run: |
+          set -e
+          for skill in miliastra-knowledge miliastra-knowledge-lua; do
+            echo "Publishing $skill"
+            skillhub publish "./skills/$skill" \
+              --changelog "Automated update from GitHub Actions"
+          done

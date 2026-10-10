@@ -1,0 +1,1145 @@
+# -*- coding: utf-8 -*-
+"""
+执行监控面板（右侧Tab）
+与 ExecutionMonitorWindow API 保持一致：start_monitoring/stop_monitoring/log/update_status 等
+本文件为重构后的主体面板，仅负责组装与委托
+"""
+
+from datetime import datetime
+from importlib.util import find_spec
+from pathlib import Path
+
+from PyQt6 import QtCore, QtWidgets, QtGui
+from PyQt6.QtCore import Qt, pyqtSignal
+from PIL import Image
+
+from app.ui.execution.execution_session import ExecutionSession
+from app.runtime.services.execution_monitor_panel_policy import (
+    compute_compact_mode_desired_window_width,
+    compute_desired_steps_width,
+    parse_program_coord,
+)
+
+from app.automation.input.common import set_visual_sink as _set_visual_sink
+from app.automation.input.common import clear_visual_sink as _clear_visual_sink
+from app.automation.input.common import set_log_sink as _set_log_sink
+from app.automation.input.common import clear_log_sink as _clear_log_sink
+
+from .actions_recognition import RecognitionActions
+from .focus_controller import FocusController
+from .log_view import LogViewController
+from .visual_renderer import VisualRenderer
+from .screenshot_worker import ScreenshotCaptureManager
+from .execution_control import ExecutionControl
+from .execution_events import ExecutionEventModel
+from . import panel_ui
+
+
+class ExecutionMonitorPanel(QtWidgets.QWidget):
+    """右侧标签中的执行监控面板"""
+
+    # 信号：停止执行
+    stop_requested = pyqtSignal()
+    # 信号：请求执行（由任务清单编排层订阅并路由到执行桥）
+    execute_clicked = pyqtSignal()
+    execute_remaining_clicked = pyqtSignal()
+    # 信号：点击了步骤标签（跳转左侧步骤）
+    step_anchor_clicked = pyqtSignal(str)  # todo_id
+    # 信号：定位镜头识别成功后，告知当前图中可见的节点ID列表（GraphModel.node_id）
+    recognition_focus_succeeded = pyqtSignal(list)
+    # 线程安全UI更新信号
+    append_log_signal = pyqtSignal(str)
+    set_status_signal = pyqtSignal(str)
+    set_progress_signal = pyqtSignal(int, int)
+    visual_update_signal = pyqtSignal(object, object)  # (PIL.Image, overlays dict or None)
+
+    def __init__(self, parent: QtWidgets.QWidget | None = None):
+        super().__init__(parent)
+
+        # 截图刷新定时器（保留，但不再主动抓取）
+        self.screenshot_timer = QtCore.QTimer()
+        self.screenshot_timer.timeout.connect(self._update_screenshot)
+        self.screenshot_interval = 500  # ms
+
+        # 外部上下文（由调用方注入）
+        self.current_graph_model = None  # 当前 GraphModel（可由执行入口或主窗口注入）
+        self.current_workspace_path = None  # 工作区路径 Path
+        self.graph_view = None  # 主编辑视图 GraphView
+        # 可选：获取当前 GraphModel 的回调（作为回退）
+        self.get_current_graph_model = None
+        # 与执行线程共享的 EditorExecutor 实例（可复用视口状态与识别缓存）
+        self._shared_executor = None
+
+        # 运行统计
+        self._current_run_total_steps: int = 0
+        self._current_run_completed: int = 0
+        self._current_run_failed: int = 0
+
+        # 构建 UI（通过 panel_ui.build_monitor_ui）
+        self._ui_refs = panel_ui.build_monitor_ui(self)
+        self._extract_ui_refs()
+
+        # 初始化委托：识别动作、定位控制器、日志控制器、渲染器、截图管理器、执行控制器
+        self._init_delegates()
+
+        # 线程安全信号
+        self.append_log_signal.connect(self._append_log_via_controller)
+        self.set_status_signal.connect(self._set_status)
+        self.set_progress_signal.connect(self._set_progress)
+        self.visual_update_signal.connect(self._render_visual_threadsafe)
+
+        # 连接 UI 控件信号
+        self._connect_ui_signals()
+
+        # OCR 依赖缺失时：允许面板作为“只读日志/截图容器”存在，但禁用执行/识别/拖拽测试等入口。
+        self._apply_ocr_availability_gate()
+
+        # 精简模式（默认关闭）：面板内容与主窗口布局同步收敛，便于低分辨率下只留“控制+日志”
+        self._compact_mode_enabled: bool = False
+        self._compact_saved_main_window_state: dict | None = None
+        # 初始化：应用一次“非精简模式”的控件显隐状态（执行入口按钮默认应隐藏）
+        self._apply_compact_panel_ui(self._compact_mode_enabled)
+        self._update_compact_mode_button_state()
+
+        # Ctrl+P 快捷键：随时暂停
+        self._ctrlp_shortcut = QtGui.QShortcut(QtGui.QKeySequence("Ctrl+P"), self)
+        # 仅在本面板（及其子控件）聚焦时生效，避免默认 WindowShortcut 造成全局抢占 Ctrl+P。
+        self._ctrlp_shortcut.setContext(QtCore.Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        self._ctrlp_shortcut.activated.connect(self.request_pause)
+
+    def _is_ocr_backend_available(self) -> bool:
+        return find_spec("rapidocr_onnxruntime") is not None
+
+    def _apply_ocr_availability_gate(self) -> None:
+        if self._is_ocr_backend_available():
+            return
+
+        tooltip = (
+            "未检测到 rapidocr_onnxruntime（OCR 依赖）。\n"
+            "本环境将禁用『执行/识别/拖拽测试』相关入口；你仍可浏览任务清单与节点图。"
+        )
+
+        # 状态提示：避免用户以为是“按钮没反应”
+        self.status_label.setText("执行不可用（未安装 OCR）")
+        self.progress_label.setText("")
+        self.log("⚠ OCR 未安装：执行监控面板已禁用执行/识别/拖拽测试入口。")
+
+        # 禁用按钮：检查/定位/拖拽/执行入口（执行入口按钮仅在精简模式显示，但仍统一禁用）
+        disable_buttons = [
+            getattr(self, "inspect_button", None),
+            getattr(self, "match_focus_button", None),
+            getattr(self, "execute_button", None),
+            getattr(self, "execute_remaining_button", None),
+            getattr(self, "drag_to_target_button", None),
+            getattr(self, "drag_left_button", None),
+            getattr(self, "drag_right_button", None),
+            getattr(self, "pause_button", None),
+            getattr(self, "resume_button", None),
+            getattr(self, "next_step_button", None),
+        ]
+        for button in disable_buttons:
+            if isinstance(button, QtWidgets.QAbstractButton):
+                button.setEnabled(False)
+                button.setToolTip(tooltip)
+
+        # 禁用测试区的所有按钮与 QAction（避免按钮 click -> action.trigger() 直接触发 OCR 调用）
+        keys_to_disable = {
+            "inspect_button",
+            "match_focus_button",
+            "execute_button",
+            "execute_remaining_button",
+            "drag_to_target_button",
+            "drag_left_button",
+            "drag_right_button",
+            "pause_button",
+            "resume_button",
+            "next_step_button",
+        }
+        for key, value in (self._ui_refs or {}).items():
+            should_disable = str(key).startswith("test_") or str(key) in keys_to_disable
+            if not should_disable:
+                continue
+            if isinstance(value, QtGui.QAction):
+                value.setEnabled(False)
+                continue
+            if isinstance(value, QtWidgets.QWidget):
+                value.setEnabled(False)
+                if isinstance(value, QtWidgets.QAbstractButton):
+                    value.setToolTip(tooltip)
+
+        # 禁用“测试”页签，默认切到“日志文本”
+        info_tabs = getattr(self, "info_tabs", None)
+        if isinstance(info_tabs, QtWidgets.QTabWidget):
+            tests_tab = getattr(self, "tests_tab", None)
+            log_tab = getattr(self, "log_tab", None)
+            if isinstance(log_tab, QtWidgets.QWidget):
+                info_tabs.setCurrentWidget(log_tab)
+            if isinstance(tests_tab, QtWidgets.QWidget):
+                idx = info_tabs.indexOf(tests_tab)
+                if idx >= 0:
+                    info_tabs.setTabEnabled(idx, False)
+
+    def _extract_ui_refs(self) -> None:
+        """从 UI 引用字典中提取控件为实例变量（便于访问）"""
+        self.status_label = self._ui_refs["status_label"]
+        self.progress_label = self._ui_refs["progress_label"]
+        self.compact_mode_button = self._ui_refs.get("compact_mode_button")
+        self.step_context_label = self._ui_refs["step_context_label"]
+        self.screenshot_label = self._ui_refs["screenshot_label"]
+        self.controls_widget = self._ui_refs.get("controls_widget")
+        self.tests_widget = self._ui_refs.get("tests_widget")
+        self.drag_widget = self._ui_refs.get("drag_widget")
+        # 右下角信息区：三子标签页（测试 / 日志表格 / 日志文本）
+        self.info_tabs = self._ui_refs.get("info_tabs")
+        self.tests_tab = self._ui_refs.get("tests_tab")
+        self.events_tab = self._ui_refs.get("events_tab")
+        self.log_tab = self._ui_refs.get("log_tab")
+        self.log_filters_widget = self._ui_refs.get("log_filters_widget")
+        self.event_filters_widget = self._ui_refs.get("event_filters_widget")
+        self.execute_button = self._ui_refs.get("execute_button")
+        self.execute_remaining_button = self._ui_refs.get("execute_remaining_button")
+        self.primary_left_stack = self._ui_refs.get("primary_left_stack")
+        self.primary_middle_stack = self._ui_refs.get("primary_middle_stack")
+        self.pause_button = self._ui_refs["pause_button"]
+        self.resume_button = self._ui_refs["resume_button"]
+        self.next_step_button = self._ui_refs["next_step_button"]
+        self.stop_button = self._ui_refs["stop_button"]
+        self.inspect_button = self._ui_refs["inspect_button"]
+        self.match_focus_button = self._ui_refs["match_focus_button"]
+        self.drag_origin_label = self._ui_refs["drag_origin_label"]
+        self.drag_target_x_input = self._ui_refs["drag_target_x_input"]
+        self.drag_target_y_input = self._ui_refs["drag_target_y_input"]
+        self.drag_to_target_button = self._ui_refs["drag_to_target_button"]
+        self.drag_left_button = self._ui_refs["drag_left_button"]
+        self.drag_right_button = self._ui_refs["drag_right_button"]
+        # 结构化执行事件表格与过滤控件
+        self.events_table = self._ui_refs.get("events_table")
+        self.event_errors_only_checkbox = self._ui_refs.get("event_errors_only_checkbox")
+        self.export_log_button = self._ui_refs.get("export_log_button")
+        self.log_text = self._ui_refs["log_text"]
+
+    def _init_delegates(self) -> None:
+        """初始化委托：识别动作、定位控制器、日志控制器、渲染器、截图管理器、执行控制器"""
+        # 日志控制器（原始文本流）
+        self._log_controller = LogViewController(
+            log_text_browser=self._ui_refs["log_text"],
+            search_input=self._ui_refs["log_search_input"],
+            filter_combo=self._ui_refs["log_filter_combo"],
+        )
+
+        # 结构化执行事件模型（表格视图）
+        self._event_model = ExecutionEventModel(self)
+        if isinstance(self.events_table, QtWidgets.QTableView):
+            table: QtWidgets.QTableView = self.events_table
+            table.setModel(self._event_model)
+            header = table.horizontalHeader()
+            header.setStretchLastSection(True)
+            header.setDefaultSectionSize(120)
+            table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+            table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
+            table.doubleClicked.connect(self._on_event_row_activated)
+        
+        # 渲染器
+        self._renderer = VisualRenderer(
+            screenshot_label=self.screenshot_label,
+            parent_widget=self,
+            get_current_display_title_callback=self._current_display_title,
+            get_current_micro_action_callback=self._current_micro_action_title,
+        )
+        
+        # 截图管理器
+        self._screenshot_manager = ScreenshotCaptureManager(
+            parent=self,
+            screenshot_interval_ms=self.screenshot_interval,
+        )
+        
+        # 执行控制器
+        self._control = ExecutionControl(
+            pause_button=self.pause_button,
+            resume_button=self.resume_button,
+            next_step_button=self.next_step_button,
+            stop_button=self.stop_button,
+            parent=self,
+        )
+        # 连接控制器信号
+        self._control.stop_requested.connect(self._on_control_stop_requested)
+        self._control.status_changed.connect(self._set_status)
+        self._control.log_message.connect(self.log)
+        
+        # 识别动作
+        self._actions = RecognitionActions(
+            log_callback=self.log,
+            update_visual_callback=self.update_visual,
+            get_graph_model_callback=self._get_graph_model,
+            get_workspace_path_callback=lambda: self.current_workspace_path,
+            get_window_title_callback=lambda: self._screenshot_manager.get_window_title(),
+        )
+        
+        # 定位控制器
+        self._focus = FocusController(
+            log_callback=self.log,
+            update_visual_callback=self.update_visual,
+            get_graph_model_callback=self._get_graph_model,
+            get_workspace_path_callback=lambda: self.current_workspace_path,
+            get_graph_view_callback=lambda: self.graph_view,
+            on_focus_succeeded_callback=self._on_focus_succeeded,
+            get_shared_executor_callback=self.get_shared_executor,
+            set_shared_executor_callback=self.set_shared_executor,
+        )
+
+    def _connect_ui_signals(self) -> None:
+        """连接 UI 控件信号到对应的槽函数"""
+        # 检查与定位
+        self.inspect_button.clicked.connect(lambda: self._actions.check_current_page())
+        self.match_focus_button.clicked.connect(lambda: self._focus.match_and_focus())
+
+        # 拖拽测试
+        self.drag_to_target_button.clicked.connect(self._on_drag_to_target_clicked)
+        self.drag_left_button.clicked.connect(lambda: self._on_directional_drag_clicked(is_left=True))
+        self.drag_right_button.clicked.connect(lambda: self._on_directional_drag_clicked(is_left=False))
+
+        # 测试动作：由 QAction 统一承载，测试页签按钮点击仅负责触发对应 QAction
+        def _connect_test_action(action_key: str, handler) -> None:
+            action = self._ui_refs.get(action_key)
+            if not isinstance(action, QtGui.QAction):
+                return
+            action.triggered.connect(lambda _checked=False: handler())
+
+        _connect_test_action("test_ocr_action", self._actions.test_ocr)
+        _connect_test_action("test_settings_action", self._actions.test_settings)
+        _connect_test_action("test_warning_action", self._actions.test_warning)
+        _connect_test_action("test_ocr_zoom_action", self._actions.test_ocr_zoom)
+        _connect_test_action("test_nodes_action", self._actions.test_nodes)
+        _connect_test_action("test_ports_action", self._actions.test_ports)
+        _connect_test_action("test_ports_deep_action", self._actions.test_ports_deep)
+        _connect_test_action("test_bool_enum_options_action", self._actions.test_bool_enum_options)
+        _connect_test_action("test_settings_tpl_action", self._actions.test_settings_tpl)
+        _connect_test_action("test_add_action", self._actions.test_add_templates)
+        _connect_test_action("test_search_action", self._actions.test_searchbar_templates)
+
+        strict_action = self._ui_refs.get("test_window_strict_action")
+        if isinstance(strict_action, QtGui.QAction):
+            strict_action.triggered.connect(lambda _checked=False: self._on_test_window_strict_clicked())
+
+        def _connect_test_button(button_key: str, action_key: str) -> None:
+            button = self._ui_refs.get(button_key)
+            action = self._ui_refs.get(action_key)
+            if not isinstance(button, QtWidgets.QAbstractButton):
+                return
+            if not isinstance(action, QtGui.QAction):
+                return
+            button.clicked.connect(
+                lambda _checked=False, action_to_trigger=action: action_to_trigger.trigger()
+            )
+
+        _connect_test_button("test_ocr_button", "test_ocr_action")
+        _connect_test_button("test_settings_button", "test_settings_action")
+        _connect_test_button("test_warning_button", "test_warning_action")
+        _connect_test_button("test_ocr_zoom_button", "test_ocr_zoom_action")
+        _connect_test_button("test_nodes_button", "test_nodes_action")
+        _connect_test_button("test_ports_button", "test_ports_action")
+        _connect_test_button("test_ports_deep_button", "test_ports_deep_action")
+        _connect_test_button("test_bool_enum_options_button", "test_bool_enum_options_action")
+        _connect_test_button("test_settings_tpl_button", "test_settings_tpl_action")
+        _connect_test_button("test_add_button", "test_add_action")
+        _connect_test_button("test_search_button", "test_search_action")
+        _connect_test_button("test_window_strict_button", "test_window_strict_action")
+
+        # 日志控制
+        self._ui_refs["log_clear_button"].clicked.connect(self.clear_log)
+        export_log_button = self._ui_refs.get("export_log_button")
+        if isinstance(export_log_button, QtWidgets.QAbstractButton):
+            export_log_button.clicked.connect(self._on_export_log_clicked)
+        self.log_text.anchorClicked.connect(self._on_anchor_clicked)
+
+        # 执行事件过滤
+        if self.event_errors_only_checkbox is not None:
+            self.event_errors_only_checkbox.toggled.connect(self._on_event_errors_only_toggled)
+
+        # 精简模式（面板内开关）
+        compact_button = self._ui_refs.get("compact_mode_button")
+        if isinstance(compact_button, QtWidgets.QAbstractButton):
+            compact_button.toggled.connect(self._on_compact_mode_toggled)
+
+        # 执行入口（在精简模式中集中提供）
+        execute_button = self._ui_refs.get("execute_button")
+        if isinstance(execute_button, QtWidgets.QAbstractButton):
+            execute_button.clicked.connect(self.execute_clicked.emit)
+        execute_remaining_button = self._ui_refs.get("execute_remaining_button")
+        if isinstance(execute_remaining_button, QtWidgets.QAbstractButton):
+            execute_remaining_button.clicked.connect(self.execute_remaining_clicked.emit)
+
+    # === 精简模式（UI 收敛 + 主窗口小窗化）========================================
+
+    @property
+    def compact_mode_enabled(self) -> bool:
+        return bool(getattr(self, "_compact_mode_enabled", False))
+
+    def set_compact_mode(self, enabled: bool) -> None:
+        target_enabled = bool(enabled)
+        if target_enabled == self.compact_mode_enabled:
+            self._update_compact_mode_button_state()
+            return
+        self._compact_mode_enabled = target_enabled
+        self._apply_compact_panel_ui(target_enabled)
+        self._apply_compact_main_window_layout(target_enabled)
+        self._update_compact_mode_button_state()
+
+    def _on_compact_mode_toggled(self, checked: bool) -> None:
+        self.set_compact_mode(bool(checked))
+
+    def _update_compact_mode_button_state(self) -> None:
+        button = self._ui_refs.get("compact_mode_button")
+        if not isinstance(button, QtWidgets.QAbstractButton):
+            return
+        desired_checked = self.compact_mode_enabled
+        if button.isChecked() != desired_checked:
+            button.blockSignals(True)
+            button.setChecked(desired_checked)
+            button.blockSignals(False)
+        if desired_checked:
+            button.setText("完整")
+            button.setToolTip("退出精简模式：恢复完整面板与布局")
+        else:
+            button.setText("精简")
+            button.setToolTip("进入精简模式：缩小窗口，只保留执行控制 / 步骤 / 日志")
+
+    def _apply_compact_panel_ui(self, enabled: bool) -> None:
+        """精简模式：隐藏非核心控件，仅保留执行控制/步骤上下文/日志。"""
+        layout = self._ui_refs.get("layout")
+        if isinstance(layout, QtWidgets.QVBoxLayout):
+            if enabled:
+                layout.setContentsMargins(6, 6, 6, 6)
+                layout.setSpacing(6)
+            else:
+                layout.setContentsMargins(8, 8, 8, 8)
+                layout.setSpacing(8)
+
+        # 核心 UI：状态/进度/步骤/控制按钮/日志
+        self.screenshot_label.setVisible(not enabled)
+        self.inspect_button.setVisible(not enabled)
+        self.match_focus_button.setVisible(not enabled)
+
+        execute_button = self._ui_refs.get("execute_button")
+        if isinstance(execute_button, QtWidgets.QWidget):
+            execute_button.setVisible(bool(enabled))
+        execute_remaining_button = self._ui_refs.get("execute_remaining_button")
+        if isinstance(execute_remaining_button, QtWidgets.QWidget):
+            execute_remaining_button.setVisible(bool(enabled))
+
+        # 控制区第一行按钮复用：完整模式显示“检查/定位”，精简模式显示“执行/执行剩余”
+        if isinstance(self.primary_left_stack, QtWidgets.QStackedWidget):
+            if enabled:
+                self.primary_left_stack.setCurrentWidget(self.execute_button)
+            else:
+                self.primary_left_stack.setCurrentWidget(self.inspect_button)
+        if isinstance(self.primary_middle_stack, QtWidgets.QStackedWidget):
+            if enabled:
+                self.primary_middle_stack.setCurrentWidget(self.execute_remaining_button)
+            else:
+                self.primary_middle_stack.setCurrentWidget(self.match_focus_button)
+
+        # 精简模式进一步收敛：为了让窗口宽度可以缩到“步骤树宽度”，
+        # 需要避免控制按钮行的 minimumSizeHint 把底部日志区撑得过宽。
+        # 保留执行入口与终止按钮，其余控制仅保留快捷键（Ctrl+P 暂停）与后台逻辑。
+        self.pause_button.setVisible(not enabled)
+        self.resume_button.setVisible(not enabled)
+        self.next_step_button.setVisible(not enabled)
+        # 终止按钮在完整/精简两种模式下都应可见；精简模式仅隐藏“暂停/继续/下一步/单步”。
+        self.stop_button.setVisible(True)
+
+        tests_widget = self._ui_refs.get("tests_widget")
+        if isinstance(tests_widget, QtWidgets.QWidget):
+            tests_widget.setVisible(not enabled)
+        drag_widget = self._ui_refs.get("drag_widget")
+        if isinstance(drag_widget, QtWidgets.QWidget):
+            drag_widget.setVisible(not enabled)
+        log_filters_widget = self._ui_refs.get("log_filters_widget")
+        if isinstance(log_filters_widget, QtWidgets.QWidget):
+            log_filters_widget.setVisible(not enabled)
+        event_filters_widget = self._ui_refs.get("event_filters_widget")
+        if isinstance(event_filters_widget, QtWidgets.QWidget):
+            event_filters_widget.setVisible(not enabled)
+
+        if isinstance(self.events_table, QtWidgets.QWidget):
+            self.events_table.setVisible(not enabled)
+
+        # 精简模式：仅保留“日志文本”页签，并隐藏 tab bar，避免额外占用高度
+        info_tabs = self._ui_refs.get("info_tabs")
+        if isinstance(info_tabs, QtWidgets.QTabWidget):
+            tests_tab = self._ui_refs.get("tests_tab")
+            events_tab = self._ui_refs.get("events_tab")
+            log_tab = self._ui_refs.get("log_tab")
+            if isinstance(log_tab, QtWidgets.QWidget):
+                info_tabs.setCurrentWidget(log_tab)
+
+            # 禁用非核心页签（保持结构不变，避免 add/removeTab 造成状态漂移）
+            if isinstance(tests_tab, QtWidgets.QWidget):
+                idx = info_tabs.indexOf(tests_tab)
+                if idx >= 0:
+                    info_tabs.setTabEnabled(idx, not enabled)
+            if isinstance(events_tab, QtWidgets.QWidget):
+                idx = info_tabs.indexOf(events_tab)
+                if idx >= 0:
+                    info_tabs.setTabEnabled(idx, not enabled)
+            # 日志页签始终可用
+            if isinstance(log_tab, QtWidgets.QWidget):
+                idx = info_tabs.indexOf(log_tab)
+                if idx >= 0:
+                    info_tabs.setTabEnabled(idx, True)
+
+            tab_bar = info_tabs.tabBar()
+            if tab_bar is not None:
+                tab_bar.setVisible(not enabled)
+
+    def _apply_compact_window_width_to_steps(self, main_window: QtWidgets.QWidget) -> None:
+        """精简模式：只收缩窗口宽度，使其“刚好够放得下步骤树”。高度保持不变。"""
+        if not self.compact_mode_enabled:
+            return
+        if not isinstance(main_window, QtWidgets.QWidget):
+            return
+
+        todo_widget = getattr(main_window, "todo_widget", None)
+        if todo_widget is None:
+            return
+
+        todo_tree = getattr(todo_widget, "tree", None)
+        if not isinstance(todo_tree, QtWidgets.QTreeWidget):
+            return
+
+        # 基于树内容的列宽推导目标宽度；补足滚动条与少量内边距，避免“刚好差一点点”导致水平滚动条出现。
+        column_width = int(todo_tree.sizeHintForColumn(0))
+        scrollbar_extent = int(
+            todo_tree.style().pixelMetric(QtWidgets.QStyle.PixelMetric.PM_ScrollBarExtent)
+        )
+        desired_steps_width = compute_desired_steps_width(
+            column_width=column_width,
+            scrollbar_extent=scrollbar_extent,
+            min_width=240,
+            extra_padding=24,
+        )
+
+        current_window_width = int(main_window.width())
+        current_window_height = int(main_window.height())
+        # 以“当前 todo_widget 占用宽度”为参照估算窗口额外开销（框架/布局微小差异）
+        todo_widget_width = int(getattr(todo_widget, "width", lambda: 0)())
+        desired_window_width = compute_compact_mode_desired_window_width(
+            current_window_width=current_window_width,
+            todo_widget_width=todo_widget_width,
+            desired_steps_width=desired_steps_width,
+        )
+
+        if current_window_width > desired_window_width and desired_window_width > 0:
+            main_window.resize(desired_window_width, current_window_height)
+
+    # === 执行入口外部控制（供 Todo 编排层同步可见性与文案）===
+
+    def set_execute_visible(self, visible: bool) -> None:
+        button = self._ui_refs.get("execute_button")
+        if isinstance(button, QtWidgets.QAbstractButton):
+            button.setVisible(bool(visible))
+
+    def set_execute_remaining_visible(self, visible: bool) -> None:
+        button = self._ui_refs.get("execute_remaining_button")
+        if isinstance(button, QtWidgets.QAbstractButton):
+            button.setVisible(bool(visible))
+
+    def set_execute_text(self, text: str) -> None:
+        button = self._ui_refs.get("execute_button")
+        if isinstance(button, QtWidgets.QAbstractButton):
+            button.setText(str(text or "执行"))
+
+    def set_execute_remaining_text(self, text: str) -> None:
+        button = self._ui_refs.get("execute_remaining_button")
+        if isinstance(button, QtWidgets.QAbstractButton):
+            button.setText(str(text or "执行剩余"))
+
+    def _apply_compact_main_window_layout(self, enabled: bool) -> None:
+        """精简模式：联动主窗口，把主要空间让给外部编辑器窗口。"""
+        main_window = self.window()
+        main_splitter = getattr(main_window, "main_splitter", None)
+        if not isinstance(main_splitter, QtWidgets.QSplitter):
+            return
+
+        nav_bar = getattr(main_window, "nav_bar", None)
+        central_stack = getattr(main_window, "central_stack", None)
+        right_panel_container = getattr(main_window, "right_panel_container", None)
+        side_tab = getattr(main_window, "side_tab", None)
+        menu_bar = getattr(main_window, "menuBar", lambda: None)()
+
+        if enabled:
+            if self._compact_saved_main_window_state is None:
+                toolbars = []
+                if hasattr(main_window, "findChildren"):
+                    toolbars = list(main_window.findChildren(QtWidgets.QToolBar))
+                saved_central_stack_size_policy = (
+                    central_stack.sizePolicy()
+                    if isinstance(central_stack, QtWidgets.QWidget)
+                    else None
+                )
+                self._compact_saved_main_window_state = {
+                    "was_maximized": bool(getattr(main_window, "isMaximized", lambda: False)()),
+                    "was_fullscreen": bool(getattr(main_window, "isFullScreen", lambda: False)()),
+                    "geometry": main_window.geometry(),
+                    "main_splitter_sizes": main_splitter.sizes(),
+                    "main_splitter_handle_width": int(main_splitter.handleWidth()),
+                    "main_splitter_orientation": main_splitter.orientation(),
+                    "nav_bar_visible": bool(getattr(nav_bar, "isVisible", lambda: True)()),
+                    "central_stack_visible": bool(getattr(central_stack, "isVisible", lambda: True)()),
+                    "central_stack_min_width": int(getattr(central_stack, "minimumWidth", lambda: 0)()),
+                    "central_stack_max_width": int(getattr(central_stack, "maximumWidth", lambda: 0)()),
+                    "central_stack_size_policy": saved_central_stack_size_policy,
+                    "right_panel_min_width": int(getattr(right_panel_container, "minimumWidth", lambda: 0)()),
+                    "right_panel_max_width": int(getattr(right_panel_container, "maximumWidth", lambda: 0)()),
+                    "menu_bar_visible": bool(getattr(menu_bar, "isVisible", lambda: True)()) if menu_bar is not None else True,
+                    "toolbars_visibility": [(tb, bool(getattr(tb, "isVisible", lambda: True)())) for tb in toolbars],
+                    "side_tab_bar_visible": bool(side_tab.tabBar().isVisible()) if hasattr(side_tab, "tabBar") else True,
+                }
+
+            if getattr(main_window, "isMaximized", lambda: False)() or getattr(
+                main_window, "isFullScreen", lambda: False
+            )():
+                main_window.showNormal()
+
+            if isinstance(nav_bar, QtWidgets.QWidget):
+                nav_bar.setVisible(False)
+            # 注意：不要隐藏 central_stack（任务清单步骤树/执行按钮在这里）。
+            # 精简模式仅应收敛“执行监控面板”的内容；主窗口只做尺寸与分栏比例的收敛。
+            if isinstance(central_stack, QtWidgets.QWidget):
+                central_stack.setVisible(True)
+                # 关键：QStackedWidget 默认会以“所有页面的最大 sizeHint/minSizeHint”作为自己的最小要求，
+                # 这会导致精简模式下 central_stack 无法被压窄，从而在步骤树两侧产生大量空白占位。
+                # 精简模式下临时将 sizePolicy 设为 Ignored，让 splitters 可以把宽度让给右侧监控面板。
+                central_stack.setMinimumWidth(0)
+                central_stack.setMaximumWidth(QtWidgets.QWIDGETSIZE_MAX)
+                central_stack.setSizePolicy(
+                    QtWidgets.QSizePolicy.Policy.Ignored,
+                    QtWidgets.QSizePolicy.Policy.Ignored,
+                )
+            if isinstance(right_panel_container, QtWidgets.QWidget):
+                right_panel_container.setVisible(True)
+                # 精简模式为“单列上下布局”：不限制宽度，避免用户把窗口拉宽后出现右侧空白。
+                right_panel_container.setMinimumWidth(0)
+                right_panel_container.setMaximumWidth(QtWidgets.QWIDGETSIZE_MAX)
+
+            # 隐藏主窗口顶部工具栏/菜单栏，释放高度
+            if menu_bar is not None and hasattr(menu_bar, "setVisible"):
+                menu_bar.setVisible(False)
+            if hasattr(main_window, "findChildren"):
+                for toolbar in main_window.findChildren(QtWidgets.QToolBar):
+                    toolbar.setVisible(False)
+
+            # 右侧 tab bar 在精简模式下隐藏（仅保留内容区域）
+            if hasattr(side_tab, "tabBar"):
+                side_tab.tabBar().setVisible(False)
+
+            # 启用任务清单侧的执行精简布局：隐藏右侧详情/预览（含节点图预览），仅保留步骤树
+            todo_widget = getattr(main_window, "todo_widget", None)
+            if todo_widget is not None and hasattr(todo_widget, "set_execution_compact_mode"):
+                todo_widget.set_execution_compact_mode(True)
+
+            # 缩小主窗口尺寸（用户仍可手动调整）。
+            # 保留任务清单区域：保证“步骤树/执行按钮”仍可见。
+            # 精简模式下，多余宽度应优先让给右侧监控面板；左侧任务区保持可用的最小宽度即可。
+            main_splitter.setHandleWidth(2)
+            main_splitter.setChildrenCollapsible(True)
+            # 需求：上面显示步骤、下面显示日志（单列）
+            main_splitter.setOrientation(Qt.Orientation.Vertical)
+            main_splitter.setStretchFactor(0, 1)  # 步骤区
+            main_splitter.setStretchFactor(1, 2)  # 日志区（更多空间）
+            main_splitter.setSizes([260, 360])
+            # 只收缩宽度，不改变高度：需要等任务树完成一次布局后再计算列宽。
+            QtCore.QTimer.singleShot(
+                0,
+                lambda: self._apply_compact_window_width_to_steps(main_window),
+            )
+            return
+
+        # disabled: restore
+        saved = self._compact_saved_main_window_state
+        if not isinstance(saved, dict):
+            return
+
+        main_window.showNormal()
+
+        # 先恢复任务清单布局，避免右侧容器尺寸恢复后仍处于隐藏堆栈状态
+        todo_widget = getattr(main_window, "todo_widget", None)
+        if todo_widget is not None and hasattr(todo_widget, "set_execution_compact_mode"):
+            todo_widget.set_execution_compact_mode(False)
+
+        if isinstance(nav_bar, QtWidgets.QWidget):
+            nav_bar.setVisible(bool(saved.get("nav_bar_visible", True)))
+        if isinstance(central_stack, QtWidgets.QWidget):
+            central_stack.setVisible(bool(saved.get("central_stack_visible", True)))
+            central_stack.setMinimumWidth(int(saved.get("central_stack_min_width", 0)))
+            central_stack.setMaximumWidth(int(saved.get("central_stack_max_width", QtWidgets.QWIDGETSIZE_MAX)))
+            saved_size_policy = saved.get("central_stack_size_policy")
+            if isinstance(saved_size_policy, QtWidgets.QSizePolicy):
+                central_stack.setSizePolicy(saved_size_policy)
+        if isinstance(right_panel_container, QtWidgets.QWidget):
+            right_panel_container.setMinimumWidth(int(saved.get("right_panel_min_width", 350)))
+            right_panel_container.setMaximumWidth(int(saved.get("right_panel_max_width", 1200)))
+
+        if menu_bar is not None and hasattr(menu_bar, "setVisible"):
+            menu_bar.setVisible(bool(saved.get("menu_bar_visible", True)))
+        toolbars_visibility = saved.get("toolbars_visibility")
+        if isinstance(toolbars_visibility, list):
+            for toolbar, was_visible in toolbars_visibility:
+                if isinstance(toolbar, QtWidgets.QToolBar):
+                    toolbar.setVisible(bool(was_visible))
+
+        if hasattr(side_tab, "tabBar"):
+            side_tab.tabBar().setVisible(bool(saved.get("side_tab_bar_visible", True)))
+
+        saved_main_splitter_handle_width = saved.get("main_splitter_handle_width")
+        if isinstance(saved_main_splitter_handle_width, int) and saved_main_splitter_handle_width > 0:
+            main_splitter.setHandleWidth(int(saved_main_splitter_handle_width))
+        saved_orientation = saved.get("main_splitter_orientation")
+        if isinstance(saved_orientation, Qt.Orientation):
+            main_splitter.setOrientation(saved_orientation)
+        # 恢复默认拉伸权重（与 UISetupMixin 初始化一致）
+        main_splitter.setStretchFactor(0, 3)
+        main_splitter.setStretchFactor(1, 1)
+
+        splitter_sizes = saved.get("main_splitter_sizes")
+        if isinstance(splitter_sizes, list) and len(splitter_sizes) >= 2:
+            main_splitter.setSizes(splitter_sizes)
+
+        geometry = saved.get("geometry")
+        if isinstance(geometry, QtCore.QRect):
+            main_window.setGeometry(geometry)
+
+        if bool(saved.get("was_fullscreen", False)):
+            main_window.showFullScreen()
+        elif bool(saved.get("was_maximized", False)):
+            main_window.showMaximized()
+
+        self._compact_saved_main_window_state = None
+
+    def _get_graph_model(self):
+        """统一的图模型获取：优先当前注入，再回退回调"""
+        graph_model = self.current_graph_model
+        if graph_model is None and self.get_current_graph_model and callable(self.get_current_graph_model):
+            graph_model = self.get_current_graph_model()
+        return graph_model
+
+    def _on_test_window_strict_clicked(self) -> None:
+        """仅窗口截图测试：点击后延时 2 秒再执行基于 PrintWindow 的截图。"""
+        self.log("仅窗口截图测试：2 秒后尝试使用 PrintWindow 抓取一帧（实验性，仅窗口截图）")
+        QtCore.QTimer.singleShot(2000, self._actions.test_window_capture_strict)
+
+    def _on_focus_succeeded(self, visible_ids: list[str]) -> None:
+        """定位镜头成功后发射信号并更新拖拽测试视口坐标显示"""
+        self._update_drag_origin_from_focus()
+        self.recognition_focus_succeeded.emit(visible_ids)
+
+    def _on_control_stop_requested(self) -> None:
+        """控制器发出停止请求"""
+        self.screenshot_timer.stop()
+        self.stop_requested.emit()
+
+    # === 属性访问（委托到控制器）===
+    @property
+    def is_running(self) -> bool:
+        return self._control.is_running
+
+    @is_running.setter
+    def is_running(self, value: bool) -> None:
+        self._control.is_running = value
+
+    @property
+    def is_paused(self) -> bool:
+        return self._control.is_paused
+
+    @is_paused.setter
+    def is_paused(self, value: bool) -> None:
+        self._control.is_paused = value
+
+    @property
+    def step_mode_enabled(self) -> bool:
+        return self._control.step_mode_enabled
+
+    @step_mode_enabled.setter
+    def step_mode_enabled(self, value: bool) -> None:
+        self._control.step_mode_enabled = value
+
+    def request_pause(self) -> None:
+        """请求暂停（供快捷键调用）"""
+        self._control.request_pause()
+
+    # === 外部调用 API ===
+    def start_monitoring(self) -> None:
+        """开始监控"""
+        if not self._is_ocr_backend_available():
+            self.status_label.setText("执行不可用（未安装 OCR）")
+            self.log("⚠ OCR 未安装：已阻止启动执行监控。")
+            return
+        self._control.start_execution()
+        self.status_label.setText("执行中（展示上一步视觉产物）")
+        self.log("开始监控：仅显示每一步产生的截图与叠加，不进行实时桌面轮询")
+        # 不启动任何定时器或后台抓取，画面仅由 update_visual() 主动更新
+        if self.screenshot_timer.isActive():
+            self.screenshot_timer.stop()
+        # 开启新会话：清空本次运行的截图记录
+        self._renderer.clear_history()
+        # 注册全局可视化/日志汇聚到本面板
+        _set_visual_sink(self.update_visual)
+        _set_log_sink(self.log)
+
+    def stop_monitoring(self) -> None:
+        """停止监控"""
+        self._control.stop_execution()
+        self.status_label.setText("已停止")
+        self.screenshot_timer.stop()
+        self.stop_screenshot_capture()
+        # 清理全局汇聚器
+        _clear_visual_sink()
+        _clear_log_sink()
+
+    def start_screenshot_capture(self, window_title: str) -> None:
+        """启动后台截图线程，将截图通过信号回传到UI线程更新"""
+        self._screenshot_manager.start_capture(window_title, self.update_screenshot)
+
+    def stop_screenshot_capture(self) -> None:
+        """停止后台截图线程"""
+        self._screenshot_manager.stop_capture()
+
+    def update_screenshot(self, screenshot: Image.Image) -> None:
+        """收到后台截图，渲染到面板"""
+        # 只要有截图就展示：不再受 is_running 限制
+        self._renderer.render_visual_snapshot(screenshot, None)
+
+    def update_visual(self, base_image: Image.Image, overlays: object | None = None) -> None:
+        """线程安全：更新监控画面为一次真实的视觉产物（截图+可选叠加）。
+        overlays 格式：
+        {
+          'rects': [ { 'bbox': (x,y,w,h), 'color': (r,g,b), 'label': str }, ... ],
+          'circles': [ { 'center': (x,y), 'radius': int, 'color': (r,g,b), 'label': str }, ... ]
+        }
+        """
+        if QtCore.QThread.currentThread() is self.thread():
+            self._renderer.render_visual(base_image, overlays)
+        else:
+            self.visual_update_signal.emit(base_image, overlays)
+
+    def _render_visual_threadsafe(self, base_image: Image.Image, overlays: object | None) -> None:
+        """线程安全渲染（由信号触发）"""
+        self._renderer.render_visual(base_image, overlays)
+
+    def eventFilter(self, obj: QtCore.QObject, event: QtCore.QEvent) -> bool:
+        """事件过滤器（委托给渲染器）"""
+        if self._renderer.eventFilter(obj, event):
+            return True
+        return super().eventFilter(obj, event)
+
+    def _current_micro_action_title(self) -> str:
+        """获取微动作标题（委托给日志控制器的最近一条日志）"""
+        log_records = getattr(self._log_controller, "_log_records", [])
+        if not isinstance(log_records, list) or len(log_records) == 0:
+            return ""
+        msg = str(log_records[-1].get('msg', '') or '').strip()
+        if not msg:
+            return ""
+        # 去掉常见前缀符号
+        if msg.startswith("· "):
+            msg = msg[2:].strip()
+        if msg.startswith("✓ ") or msg.startswith("✗ ") or msg.startswith("⚠ "):
+            msg = msg[2:].strip()
+        # 限长显示避免过长
+        if len(msg) > 64:
+            msg = msg[:64] + "…"
+        return msg
+
+    def _current_display_title(self) -> str:
+        """获取当前显示标题（委托给日志控制器）"""
+        return self._log_controller.get_current_display_title()
+
+    # === 拖拽测试相关 ===
+
+    def _update_drag_origin_from_focus(self) -> None:
+        """根据 FocusController 中记录的视口矩形，刷新拖拽测试区的当前中心显示。"""
+        if not hasattr(self, "_focus") or self._focus is None:
+            self.drag_origin_label.setText("未定位")
+            return
+        center = self._focus.get_last_program_viewport_center()
+        if center is None:
+            self.drag_origin_label.setText("未定位")
+            return
+        center_x, center_y = center
+        self.drag_origin_label.setText(f"({center_x:.1f}, {center_y:.1f})")
+        # 若用户尚未填写目标坐标，优先填入当前中心，便于在此基础上偏移
+        if not str(self.drag_target_x_input.text() or "").strip():
+            self.drag_target_x_input.setText(f"{center_x:.1f}")
+        if not str(self.drag_target_y_input.text() or "").strip():
+            self.drag_target_y_input.setText(f"{center_y:.1f}")
+
+    def _on_drag_to_target_clicked(self) -> None:
+        """拖拽到用户指定的程序坐标（X/Y 输入框）。"""
+        center = None
+        if hasattr(self, "_focus") and self._focus is not None:
+            center = self._focus.get_last_program_viewport_center()
+        target_x = parse_program_coord(self.drag_target_x_input.text())
+        target_y = parse_program_coord(self.drag_target_y_input.text())
+        if target_x is None or target_y is None:
+            if center is None:
+                self.log("✗ 拖拽测试：请先点击一次“定位镜头”，并在 X/Y 输入框中填写合法的数值")
+                return
+            if target_x is None:
+                target_x = center[0]
+            if target_y is None:
+                target_y = center[1]
+        self.log(f"拖拽测试：目标程序坐标≈({float(target_x):.1f}, {float(target_y):.1f})")
+        if hasattr(self, "_focus") and self._focus is not None:
+            self._focus.ensure_point_visible(float(target_x), float(target_y))
+            self._update_drag_origin_from_focus()
+
+    def _on_directional_drag_clicked(self, is_left: bool) -> None:
+        """以最近一次视口中心为基准，向左或向右拖拽一段距离。"""
+        if not hasattr(self, "_focus") or self._focus is None:
+            self.log("✗ 拖拽测试：尚未建立坐标映射，请先点击一次“定位镜头”按钮")
+            return
+        center = self._focus.get_last_program_viewport_center()
+        if center is None:
+            self.log("✗ 拖拽测试：当前无可用视口中心，请先执行一次“定位镜头”")
+            return
+        base_x, base_y = center
+        # 若用户在 X 输入框中填写了数值，则作为偏移量使用；否则采用默认步长
+        offset_value = parse_program_coord(self.drag_target_x_input.text())
+        if offset_value is None:
+            offset_value = 400.0
+        step = float(offset_value)
+        if step < 0:
+            step = -step
+        if is_left:
+            target_x = base_x - step
+            direction_text = "向左"
+        else:
+            target_x = base_x + step
+            direction_text = "向右"
+        target_y = base_y
+        self.drag_target_x_input.setText(f"{target_x:.1f}")
+        self.drag_target_y_input.setText(f"{target_y:.1f}")
+        self.log(
+            f"拖拽测试：{direction_text}拖拽一段距离，目标程序坐标≈({target_x:.1f}, {target_y:.1f})"
+        )
+        self._focus.ensure_point_visible(float(target_x), float(target_y))
+        self._update_drag_origin_from_focus()
+
+    def update_status(self, status: str) -> None:
+        if QtCore.QThread.currentThread() is self.thread():
+            self._set_status(status)
+        else:
+            self.set_status_signal.emit(status)
+
+    def update_progress(self, current: int, total: int) -> None:
+        if QtCore.QThread.currentThread() is self.thread():
+            self._set_progress(current, total)
+        else:
+            self.set_progress_signal.emit(current, total)
+
+    def log(self, message: str) -> None:
+        if QtCore.QThread.currentThread() is self.thread():
+            self._log_controller.append(message)
+        else:
+            self.append_log_signal.emit(message)
+
+    # === 结构化执行事件 API（供执行桥接层调用）===
+
+    def begin_run(self, total_steps: int) -> str:
+        """
+        标记一次新的执行运行开始，并在事件表格中记录 RUN_STARTED。
+
+        返回:
+            run_id 字符串（当前仅用于内部标识）
+        """
+        if not hasattr(self, "_event_model") or self._event_model is None:
+            return ""
+        self._current_run_total_steps = int(total_steps or 0)
+        self._current_run_completed = 0
+        self._current_run_failed = 0
+        run_id = self._event_model.start_new_run(self._current_run_total_steps)
+        if self._current_run_total_steps > 0:
+            self.progress_label.setText(f"步骤: 0/{self._current_run_total_steps}")
+        return run_id
+
+    def end_run(self, success: bool, reason: str | None = None) -> None:
+        """结束当前运行，在事件表格中记录结果并更新状态标签。"""
+        if hasattr(self, "_event_model") and self._event_model is not None:
+            self._event_model.finish_run(bool(success), reason=reason)
+        if success:
+            self.status_label.setText("执行完成")
+        else:
+            self.status_label.setText("执行结束（含失败）")
+
+    def notify_step_started(
+        self,
+        todo_id: str,
+        title: str,
+        index: int | None,
+        total_steps: int | None,
+    ) -> None:
+        """记录某个步骤即将开始（由执行桥接层调用）。"""
+        if not hasattr(self, "_event_model") or self._event_model is None:
+            return
+        total = total_steps if total_steps is not None else self._current_run_total_steps
+        self._event_model.add_step_started(todo_id, title, index, total or None)
+
+    def notify_step_completed(
+        self,
+        todo_id: str,
+        title: str,
+        index: int | None,
+        total_steps: int | None,
+        success: bool,
+        reason: str | None = None,
+    ) -> None:
+        """记录某个步骤完成，并更新运行统计。"""
+        if not hasattr(self, "_event_model") or self._event_model is None:
+            return
+        total = total_steps if total_steps is not None else self._current_run_total_steps
+        self._event_model.add_step_completed(todo_id, title, index, total or None, success, reason)
+        # 更新统计
+        self._current_run_completed += 1
+        if not success:
+            self._current_run_failed += 1
+        if total and total > 0:
+            if self._current_run_failed > 0:
+                self.progress_label.setText(
+                    f"步骤: {self._current_run_completed}/{total}（失败 {self._current_run_failed}）"
+                )
+            else:
+                self.progress_label.setText(f"步骤: {self._current_run_completed}/{total}")
+
+    def notify_step_skipped(
+        self,
+        todo_id: str,
+        title: str,
+        index: int | None,
+        total_steps: int | None,
+        reason: str,
+    ) -> None:
+        """记录某个步骤被跳过（仅在确实被视为“跳过”时调用）。"""
+        if not hasattr(self, "_event_model") or self._event_model is None:
+            return
+        total = total_steps if total_steps is not None else self._current_run_total_steps
+        self._event_model.add_step_skipped(todo_id, title, index, total or None, reason)
+
+    def set_current_step_context(self, step_title: str, parent_title: str) -> None:
+        """设置当前步骤上下文（委托给日志控制器 + 更新 UI 标签）"""
+        self._log_controller.set_current_step_context(step_title, parent_title)
+        # 更新 UI 标签
+        self.step_context_label.setText(f"步骤: {step_title}" if step_title else "")
+        # 回填最近的空标题项，避免早期截图（如启动校验）无标题
+        self._renderer.backfill_recent_empty_titles()
+
+    def set_current_step_tokens(self, step_id: str, tokens: list) -> None:
+        """设置用于每行行首展示的分段富文本（委托给日志控制器）"""
+        self._log_controller.set_current_step_tokens(step_id, tokens)
+        # 回填最近的空标题项
+        self._renderer.backfill_recent_empty_titles()
+
+    def clear_log(self) -> None:
+        """清空日志（委托给日志控制器）"""
+        self._log_controller.clear()
+
+    def _on_export_log_clicked(self) -> None:
+        """导出当前会话的全部日志为 TXT 文件（选择目录后写入）。"""
+        initial_directory = QtCore.QDir.homePath()
+        if self.current_workspace_path is not None:
+            initial_directory = str(self.current_workspace_path)
+
+        selected_directory = QtWidgets.QFileDialog.getExistingDirectory(
+            self,
+            "选择导出目录",
+            initial_directory,
+        )
+        if not selected_directory:
+            return
+
+        export_text = self._log_controller.build_plain_text_export()
+        timestamp_text = datetime.now().strftime("%Y%m%d_%H%M%S")
+        export_file_name = f"执行监控日志_{timestamp_text}.txt"
+        export_file_path = Path(selected_directory) / export_file_name
+        export_file_path.write_text(export_text, encoding="utf-8")
+        self.log(f"✓ 日志已导出：{export_file_path}")
+
+    def wait_if_paused(self) -> None:
+        """等待（阻塞），直到不再暂停（委托给控制器）"""
+        self._control.wait_if_paused()
+
+    def is_execution_allowed(self) -> bool:
+        """检查是否允许执行（委托给控制器）"""
+        return self._control.is_execution_allowed()
+
+    def is_step_mode_enabled(self) -> bool:
+        """检查是否启用单步模式（委托给控制器）"""
+        return self._control.is_step_mode_enabled()
+
+    # === 私有槽 ===
+    def _append_log_via_controller(self, message: str) -> None:
+        """通过日志控制器追加日志（用于线程安全信号）"""
+        self._log_controller.append(message)
+
+    def _set_status(self, status: str) -> None:
+        self.status_label.setText(status)
+
+    def _set_progress(self, current: int, total: int) -> None:
+        if total > 0:
+            self.progress_label.setText(f"进度: {current}/{total} ({current*100//total}%)")
+        else:
+            self.progress_label.setText(f"进度: {current}")
+
+    def _on_anchor_clicked(self, url: QtCore.QUrl) -> None:
+        """处理日志锚点点击（委托给日志控制器解析，然后发射信号）"""
+        todo_id = self._log_controller.on_anchor_clicked(url)
+        if todo_id:
+            self.step_anchor_clicked.emit(todo_id)
+
+    def _on_event_row_activated(self, index: QtCore.QModelIndex) -> None:
+        """双击执行事件表格行：根据 todo_id 在左侧任务/图中定位。"""
+        if not index.isValid():
+            return
+        model = getattr(self, "_event_model", None)
+        if model is None:
+            return
+        event = model.get_event_at(index.row())
+        if event is None or not event.todo_id:
+            return
+        self.step_anchor_clicked.emit(str(event.todo_id))
+
+    def _on_event_errors_only_toggled(self, checked: bool) -> None:
+        """切换“仅错误/警告”过滤。"""
+        model = getattr(self, "_event_model", None)
+        if model is None:
+            return
+        model.set_only_errors(bool(checked))
+
+    def _update_screenshot(self) -> None:
+        # 外部拉取截图后调用 update_screenshot，这里不主动抓取
+        pass
+
+    # === 外部注入上下文 ===
+    def set_context(self, workspace_path, graph_model, graph_view=None) -> None:
+        """设置执行上下文"""
+        self.current_workspace_path = workspace_path
+        self.current_graph_model = graph_model
+        if graph_view is not None:
+            self.graph_view = graph_view
+
+    def attach_session(self, session: ExecutionSession) -> None:
+        """绑定一次执行会话（集中注入 workspace/model/view/executor）。"""
+        self.set_context(
+            session.workspace_path,
+            session.graph_model,
+            session.graph_view,
+        )
+        if session.executor is not None:
+            self.set_shared_executor(session.executor)
+
+    # === 与执行子系统共享 EditorExecutor 实例（用于复用视口状态） ===
+    def get_shared_executor(self):
+        return self._shared_executor
+
+    def set_shared_executor(self, executor) -> None:
+        self._shared_executor = executor
+

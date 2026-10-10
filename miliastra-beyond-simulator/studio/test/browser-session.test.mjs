@@ -1,0 +1,200 @@
+import { test } from 'node:test'
+import assert from 'node:assert/strict'
+import { createPlaySession, keyEventName, PLAY_MOVE_THROTTLE_MS, PLAY_POLL_INTERVAL_MS } from '../play/browser-session.js'
+import { createStudio } from '../index.js'
+
+test('reloading a browser attaches to the existing paused game without a start or player change', async t => {
+  const calls = [], rendered = []
+  const snapshot = { running: true, paused: true, frame: 1254, time: 41.8,
+    canvasWidth: 1280, canvasHeight: 720, viewPlayerIndex: 2,
+    scene: { format: 'tree-v1', revision: 7, reset: true, nodes: [] } }
+  const play = createPlaySession({
+    renderer: { async applyScene(scene) { rendered.push(scene) } },
+    async api(action, args) { calls.push({ action, args }); return snapshot },
+  })
+  t.after(() => play.destroy())
+  await play.attach()
+  play.stopPolling()
+  assert.deepEqual(calls, [{ action: 'get', args: { view: true, compact: true, sceneRev: 0 } }])
+  assert.equal(play.running, true)
+  assert.equal(play.snapshot.paused, true)
+  assert.equal(play.snapshot.frame, 1254)
+  assert.equal(play.snapshot.viewPlayerIndex, 2)
+  assert.equal(play.sceneRev, 7)
+  assert.equal(rendered.length, 1)
+})
+
+test('shared play loop polls compact scene views and sends light input', async () => {
+  const calls = []
+  const scenes = []
+  const statuses = []
+  let sceneRevSeen
+  const renderer = {
+    applied: [],
+    async applyScene(scene, width, height) { this.applied.push({ scene, width, height }) },
+    async render() {},
+    destroy() { this.destroyed = true },
+  }
+  const play = createPlaySession({
+    renderer,
+    async api(action, args = {}) {
+      calls.push({ action, args })
+      if (action === 'start' || action === 'get') {
+        sceneRevSeen = args.sceneRev
+        return {
+          running: true,
+          paused: false,
+          frame: calls.length,
+          time: 0.1,
+          canvasWidth: 1600,
+          canvasHeight: 900,
+          scene: { format: 'tree-v1', revision: 2, reset: action === 'start', nodes: [] },
+        }
+      }
+      if (action === 'pointer' || action === 'key' || action === 'step') {
+        return { running: true, paused: false, frame: 3, time: 0.2 }
+      }
+      if (action === 'stop') return { running: false }
+      return { running: true }
+    },
+    onSnapshot: (next) => scenes.push(next),
+    onStatus: (next) => statuses.push(next),
+  })
+
+  await play.start({ canvasId: 'pc-16-9' })
+  assert.equal(calls[0].action, 'start')
+  assert.equal(calls[0].args.view, true)
+  assert.equal(calls[0].args.compact, true)
+  assert.equal(calls[0].args.canvasId, 'pc-16-9')
+  assert.equal(renderer.applied.length, 1)
+  assert.equal(scenes.length, 1)
+
+  await play.act('pointer', { type: 'down', x: 10, y: 20 })
+  const pointer = calls.find((call) => call.action === 'pointer')
+  assert.equal(pointer.args.light, true)
+  assert.equal(pointer.args.type, 'down')
+  assert.equal(statuses.length, 1)
+
+  await play.poll()
+  const get = calls.find((call) => call.action === 'get')
+  assert.equal(get.args.view, true)
+  assert.equal(get.args.compact, true)
+  assert.equal(get.args.sceneRev, 2)
+  assert.equal(sceneRevSeen, 2)
+
+  play.destroy()
+  assert.equal(renderer.destroyed, true)
+  assert.equal(PLAY_POLL_INTERVAL_MS, 33)
+  assert.equal(keyEventName({ code: 'Digit1' }, 'Down'), 'KeyboardCraftspersonKey1Down')
+  assert.equal(keyEventName({ code: 'KeyA' }, 'Down'), '')
+})
+
+const CURSOR_EVENTS = ['CursorDown', 'CursorUp', 'CursorClick', 'CursorBeginDrag', 'CursorDrag', 'CursorEndDrag']
+const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+async function bindStudioPlay(t) {
+  const studio = createStudio()
+  studio.patch({ op: 'addScript', controlId: 'n1', controlAsset: 'server-control-template', path: 'main', source: `
+function OnStart()
+  script.object.showCursor = true
+  local button = script.object:FindChild("预设按钮")
+  for _, name in ipairs({ ${CURSOR_EVENTS.map((name) => `"${name}"`).join(', ')} }) do
+    button:AddCursorEventListener(Enum.CursorEventType[name], function() print(name) end)
+  end
+end` })
+  const pointers = []
+  const play = createPlaySession({
+    renderer: { async applyScene() {}, async render() {} },
+    async api(action, args = {}) {
+      if (action === 'start') return studio.playStart(args)
+      if (action === 'get') return studio.playGet(args)
+      if (action === 'stop') return studio.playStop()
+      if (action === 'pointer') {
+        pointers.push(args)
+        return studio.playPointer(args.type, args.x, args.y, { observe: false })
+      }
+      return null
+    },
+  })
+  t.after(() => { play.destroy(); studio.playStop() })
+  await play.start()
+  const { canvasWidth: width, canvasHeight: height } = play.snapshot
+  const handlers = {}
+  play.bindInput({
+    addEventListener(type, fn) { handlers[type] = fn },
+    removeEventListener(type) { delete handlers[type] },
+    getBoundingClientRect: () => ({ left: 0, width, bottom: height, height }),
+  }, { keysOn: { addEventListener() {}, removeEventListener() {} } })
+  const fire = (type, x, y) => handlers[type]({ pointerId: 1, clientX: x, clientY: height - y })
+  const cursorLogs = () => studio.playGet().logs.map((row) => row.text).filter((text) => CURSOR_EVENTS.includes(text))
+  return { play, pointers, fire, cursorLogs }
+}
+
+test('a quick browser drag reaches Lua as down, move, up instead of a click', async t => {
+  const { pointers, fire, cursorLogs } = await bindStudioPlay(t)
+  fire('pointerdown', 790, 450)
+  fire('pointermove', 810, 450)
+  fire('pointerup', 810, 450)
+  await wait(PLAY_MOVE_THROTTLE_MS + 20)
+  assert.deepEqual(pointers.map(({ type, x }) => `${type}:${x}`), ['down:790', 'move:810', 'up:810'])
+  assert.deepEqual(cursorLogs(), ['CursorDown', 'CursorBeginDrag', 'CursorDrag', 'CursorUp', 'CursorEndDrag'])
+})
+
+test('browser clicks still click and throttled moves coalesce without stale replays', async t => {
+  const { pointers, fire, cursorLogs } = await bindStudioPlay(t)
+  fire('pointerdown', 800, 450)
+  fire('pointerup', 800, 450)
+  fire('pointermove', 801, 450)
+  fire('pointermove', 802, 450)
+  await wait(PLAY_MOVE_THROTTLE_MS + 20)
+  fire('pointermove', 803, 450)
+  fire('pointerdown', 803, 450)
+  fire('pointerup', 803, 450)
+  await wait(PLAY_MOVE_THROTTLE_MS + 20)
+  assert.deepEqual(pointers.map(({ type, x }) => `${type}:${x}`),
+    ['down:800', 'up:800', 'move:802', 'move:803', 'down:803', 'up:803'])
+  assert.deepEqual(cursorLogs(), ['CursorDown', 'CursorUp', 'CursorClick', 'CursorDown', 'CursorUp', 'CursorClick'])
+})
+
+test('pending browser moves are dropped when the play session resets', async t => {
+  const { play, pointers, fire } = await bindStudioPlay(t)
+  fire('pointermove', 810, 450)
+  play.reset()
+  await wait(PLAY_MOVE_THROTTLE_MS + 20)
+  assert.deepEqual(pointers, [])
+})
+
+test('wheel pixels/lines/pages scale into canvas units and cancellation ignores a second touch', async t => {
+  const calls = [], handlers = {}
+  const play = createPlaySession({
+    renderer: { async applyScene() {} },
+    async api(action, args) {
+      calls.push({ action, args })
+      return { running: true, canvasWidth: 1600, canvasHeight: 900 }
+    },
+  })
+  t.after(() => play.destroy())
+  await play.start()
+  play.stopPolling()
+  const surface = {
+    addEventListener(type, fn) { handlers[type] = fn }, removeEventListener(type) { delete handlers[type] },
+    getBoundingClientRect: () => ({ left: 10, bottom: 500, width: 800, height: 450 }),
+  }
+  const dispose = play.bindInput(surface)
+  let prevented = 0
+  for (const deltaMode of [0, 1, 2]) handlers.wheel({ clientX: 410, clientY: 275, deltaMode, deltaX: 1, deltaY: 2, preventDefault() { prevented++ } })
+  const wheels = calls.filter(c => c.args?.type === 'wheel').map(c => c.args)
+  assert.deepEqual(wheels.map(c => [c.x, c.y, c.deltaX, c.deltaY]), [[800, 450, 2, 4], [800, 450, 32, 64], [800, 450, 1600, 1800]])
+  assert.equal(prevented, 3)
+  const p = { pointerId: 1, clientX: 410, clientY: 275 }
+  handlers.pointerdown(p)
+  handlers.pointermove({ ...p, pointerId: 2, clientY: 240 })
+  handlers.pointerup({ ...p, pointerId: 2 })
+  handlers.pointermove({ ...p, clientY: 250 })
+  handlers.pointercancel(p)
+  handlers.pointerup(p)
+  await wait(PLAY_MOVE_THROTTLE_MS + 20)
+  assert.deepEqual(calls.filter(c => c.action === 'pointer' && c.args.type !== 'wheel').map(c => c.args.type), ['down', 'cancel'])
+  dispose()
+  assert.equal(Object.keys(handlers).length, 0)
+})

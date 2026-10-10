@@ -1,0 +1,57 @@
+import { LLMConfig } from '../types'
+import { DEFAULT_LANGUAGE, SupportedLanguage } from '../i18n'
+
+const CONFIG_KEY = 'llm_config'
+
+// 随机选择渠道，按权重分配概率
+export const getRandomChannel = (): number => {
+  const throughput = [0, 0, 100, 1000]  // 渠道 1, 2, 3, 4 的权重
+  const totalThroughput = throughput.reduce((sum, val) => sum + val, 0)
+  
+  const rand = Math.floor(Math.random() * totalThroughput)
+  let cumulative = 0
+  
+  for (let i = 0; i < throughput.length; i++) {
+    cumulative += throughput[i]
+    if (rand < cumulative) {
+      return i + 1
+    }
+  }
+  
+  return 4  // fallback
+}
+
+const defaultConfig: LLMConfig = {
+  api_key: '',
+  api_base_url: 'https://api.deepseek.com/v1',
+  model: 'deepseek-v4-flash',
+  use_default_model: getRandomChannel(),
+  context_length: 1,
+  answer_language: DEFAULT_LANGUAGE,
+}
+
+export const getConfig = (): LLMConfig => {
+  const stored = localStorage.getItem(CONFIG_KEY)
+  if (stored) {
+    try {
+      const parsed = JSON.parse(stored) as Partial<LLMConfig>
+      return { ...defaultConfig, ...parsed }
+    } catch {
+      return defaultConfig
+    }
+  }
+  return defaultConfig
+}
+
+export const saveConfig = (config: LLMConfig): void => {
+  localStorage.setItem(CONFIG_KEY, JSON.stringify(config))
+}
+
+/** 将回答语言同步到 LLMConfig（随 UI 语言切换联动）。 */
+export const syncAnswerLanguage = (lang: SupportedLanguage): void => {
+  const config = getConfig()
+  if (config.answer_language !== lang) {
+    config.answer_language = lang
+    saveConfig(config)
+  }
+}

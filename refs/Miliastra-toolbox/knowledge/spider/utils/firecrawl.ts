@@ -1,0 +1,375 @@
+/**
+ * Firecrawl 集成模块 - 简化版本
+ * 封装 Firecrawl API 调用，保留核心功能
+ */
+
+import Firecrawl, {
+  CrawlJob,
+  CrawlResponse,
+  Document,
+  FormatOption
+} from '@mendable/firecrawl-js';
+import { URLEntry, ScrapeResult, URLExtractResult } from '../types.js';
+import dotenv from 'dotenv';
+import fs from 'fs/promises';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import { dirname } from 'path';
+import { buildAbsoluteMarkdownPath } from './documentPath.js';
+import { FilterConfig, redactMarkdown } from './filterConfig.js';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+
+// 加载环境变量
+dotenv.config({ path: path.join(__dirname, '..', '.env') });
+
+export class FirecrawlClient {
+  private client: Firecrawl;
+  
+  constructor(apiKey: string) {
+    if (!apiKey) {
+      throw new Error('Firecrawl API Key is required');
+    }
+    this.client = new Firecrawl({ apiKey });
+  }
+  
+  /**
+   * 启动爬取任务并返回任务信息
+   * 这是推荐的方式，因为它只返回任务 ID 而不是轮询整个任务。
+   */
+  async startCrawl(url: string, options?: { limit?: number }): Promise<CrawlResponse> {
+    const crawlOptions = options ? { limit: options.limit || 500 } : { limit: 500 };
+    const result: CrawlResponse = await this.client.startCrawl(url, crawlOptions);
+    return result;
+  }
+
+  /**
+   * 获取爬取任务状态和结果
+   * 直接返回 SDK 的 CrawlJob 类型，确保类型安全
+   */
+  async getCrawlStatus(crawlId: string): Promise<CrawlJob> {
+    const result: CrawlJob = await this.client.getCrawlStatus(crawlId);
+    return result;
+  }
+
+  /**
+   * 使用便捷方法启动爬取任务并等待完成
+   * 适合需要等待所有结果的应用场景
+   */
+  async crawlAndWait(url: string, options?: { limit?: number; timeout?: number }): Promise<CrawlJob> {
+    const result: CrawlJob = await this.client.crawl(url, {
+      limit: options?.limit || 500,
+      timeout: options?.timeout || 300 // 默认 5 分钟超时
+    });
+    return result;
+  }
+
+  /**
+   * 提取URL列表并等待完成
+   * 统一封装爬取逻辑，便于迁移到其他API
+   */
+  async extractURLs(url: string, scope: string, options?: { limit?: number }): Promise<URLExtractResult> {
+    console.log(`   🔄 启动爬取任务...`);
+    
+    // 启动爬取任务
+    const job: CrawlJob = await this.crawlAndWait(url);
+    // 爬取已经完成，直接使用结果
+    const completed = job.completed || 0;
+    const total = job.total || 0;
+    
+    console.log(`   ✓ 爬取完成: ${completed}/${total} 个页面`);
+
+    if (job.status != 'completed') {
+      throw new Error(`Crawl task failed ${job.status}`);
+    }
+    
+    // 提取所有链接及其元数据
+    const entries: URLEntry[] = [];
+    
+    if (job.data) {
+      for (const [idx, page] of job.data.entries()) {
+        // 从每个页面的 markdown 内容中解析链接
+        const markdown = page.markdown || '';
+        
+        // 保存页面markdown到指定路径
+        const dataDir = path.join(__dirname, '..', 'data');
+        await fs.mkdir(dataDir, { recursive: true });
+        const scopeFilePath = path.join(dataDir, `${scope}_${idx}.md`);
+        await fs.writeFile(scopeFilePath, markdown, 'utf-8');
+        
+        // 正则表达式匹配 [标题](URL) 格式的链接
+        const linkRegex = /\[([^\]]+)\]\((https:\/\/act\.mihoyo\.com\/ys\/ugc\/[a-z0-9/]+)\)/g;
+        
+        let match;
+        while ((match = linkRegex.exec(markdown)) !== null) {
+          const title = match[1];
+          const pageUrl = match[2];
+                      
+          // 从 URL 提取 ID（格式：.../detail/mh29wpicgvh0）
+          const idMatch = pageUrl.match(/\/detail\/([a-z0-9]+)$/);
+          const id = idMatch ? idMatch[1] : `unknown-${Date.now()}`;
+          
+          entries.push({
+            id,
+            title: title,
+            url: pageUrl,
+            uniqueId: pageUrl, // 使用URL作为唯一标识符
+            scope: scope,
+          });
+        }
+      }
+    }
+
+    // 按 title 字典序 排序
+    entries.sort((a, b) => a.title.localeCompare(b.title));
+    
+    return {
+      entries,
+      totalPages: total,
+      completedPages: completed,
+    };
+  }
+
+  /**
+    * 爬取单个 URL（使用 scrape 方法）
+    * 按照官方文档格式处理响应，并保存 markdown 文件
+    */
+  async scrapeURL(url: string, options?: {
+    scope?: string;
+    saveMarkdown?: boolean;
+    outputDir?: string;
+    documentId?: string;
+    title?: string; // 新增：支持传递自定义标题
+    checkChanges?: boolean; // 新增：检查内容是否变化
+    filterConfig?: FilterConfig;
+  }): Promise<ScrapeResult & { fileSaved?: boolean }> {
+    try {
+      // 逐级降级爬取，确保拿到文档正文
+      const result: Document = await this.scrapeWithFallback(url);
+
+      // 新版本直接返回数据，没有success属性
+      const markdown = redactMarkdown(result.markdown || '', options?.documentId || this.extractIdFromUrl(url), options?.filterConfig);
+      const metadata = result.metadata || {};
+      
+      if (!markdown) {
+        return {
+          success: false,
+          markdown: '',
+          metadata: { title: '' },
+          error: 'No content returned from scrape',
+        };
+      }
+
+      // 保存 markdown 文件
+      const saveMarkdown = options?.saveMarkdown ?? true;
+      let fileSaved = false;
+      if (saveMarkdown) {
+        const outputDir = options?.outputDir || path.join(__dirname, '..', 'data');
+        const documentId = options?.documentId || this.extractIdFromUrl(url);
+        const scope = options?.scope || 'tutorial';
+        const title = options?.title || metadata.title || '未命名文档'; // 优先使用传入的标题
+        
+        try {
+          fileSaved = await this.saveMarkdownFile(
+            markdown,
+            outputDir,
+            scope,
+            documentId,
+            title,
+            {
+              title: title,
+              url: url,
+              sourceURL: metadata.sourceURL || url,
+              description: metadata.description,
+              language: metadata.language || 'zh',
+            },
+            options?.checkChanges
+          );
+        } catch (saveError) {
+          throw new Error(`保存 markdown 文件失败: ${(saveError as Error).message}`);
+        }
+      }
+      
+      return {
+        success: true,
+        markdown,
+        metadata: {
+          title: metadata.title || '未命名文档',
+          description: metadata.description,
+          language: metadata.language || 'zh',
+          sourceURL: metadata.sourceURL || url,
+        },
+        fileSaved
+      };
+    } catch (error) {
+      return {
+        success: false,
+        markdown: '',
+        metadata: { title: '' },
+        error: (error as Error).message,
+      };
+    }
+  }
+
+  /** 官方页面通过该静态路径加载单篇正文。 */
+  private staticContentURL(url: string): string | undefined {
+    const match = url.match(/^https:\/\/act\.mihoyo\.com\/ys\/ugc\/tutorial\/(?:(course|faq)\/)?detail\/([a-z0-9]+)$/);
+    if (!match) return undefined;
+    const category = match[1] || 'knowledge';
+    return `https://act-webstatic.mihoyo.com/ugc-tutorial/${category}/cn/zh-cn/${match[2]}/content.html?v=1016`;
+  }
+
+  private repairStaticMarkdownEncoding(markdown: string): string {
+    const decoder = new TextDecoder('windows-1252');
+    const inverse = new Map<string, number>();
+    for (let byte = 0; byte < 256; byte++) {
+      inverse.set(decoder.decode(Uint8Array.of(byte)), byte);
+    }
+    const bytes: number[] = [];
+    for (const character of markdown) {
+      const byte = inverse.get(character);
+      if (byte === undefined) return markdown;
+      bytes.push(byte);
+    }
+    try {
+      return new TextDecoder('utf-8', { fatal: true }).decode(Uint8Array.from(bytes));
+    } catch {
+      return markdown;
+    }
+  }
+
+  private async scrapeStaticContent(url: string): Promise<Document> {
+    const staticURL = this.staticContentURL(url);
+    if (!staticURL) throw new Error(`无法构建官方静态正文地址: ${url}`);
+    await new Promise(resolve => setTimeout(resolve, 16000));
+    const result = await this.client.scrape(staticURL, {
+      formats: ['markdown'],
+      onlyMainContent: true,
+      maxAge: 0,
+      timeout: 180000,
+    });
+    result.markdown = this.repairStaticMarkdownEncoding(result.markdown || '');
+    if (!result.markdown.trim()) throw new Error(`官方静态正文为空: ${staticURL}`);
+    console.log('   ℹ️ 使用官方静态正文补抓');
+    return result;
+  }
+
+  /** 先抓页面容器，失败或正文为空时尝试官方静态正文。 */
+  private async scrapeWithFallback(url: string): Promise<Document> {
+    const baseOpts = {
+      formats: ['markdown' as const],
+      excludeTags: ['nav', 'footer', 'header', 'aside', 'script', 'style'],
+      onlyMainContent: true,
+      waitFor: 2000,
+      timeout: 180000,
+    };
+
+    try {
+      let result: Document = await this.client.scrape(url, {
+        ...baseOpts,
+        includeTags: ['.doc-view'],
+        maxAge: 4 * 60 * 60 * 1000,
+      });
+      if (result.markdown && result.markdown.trim()) return result;
+
+      await new Promise(resolve => setTimeout(resolve, 16000));
+      result = await this.client.scrape(url, {
+        ...baseOpts,
+        includeTags: ['.doc-view'],
+        maxAge: 0,
+      });
+      if (result.markdown && result.markdown.trim()) {
+        console.log('   ℹ️ 命中绕过缓存的 .doc-view 结果');
+        return result;
+      }
+
+      await new Promise(resolve => setTimeout(resolve, 16000));
+      result = await this.client.scrape(url, {
+        ...baseOpts,
+        maxAge: 0,
+      });
+      if (result.markdown && result.markdown.trim()) {
+        console.log('   ℹ️ 命中无 includeTags 的回退结果（页面无 .doc-view 容器）');
+        return result;
+      }
+      throw new Error('页面正文为空');
+    } catch (error) {
+      if (!this.staticContentURL(url)) throw error;
+      console.warn(`   ⚠️ 页面抓取失败，尝试官方静态正文: ${(error as Error).message}`);
+      return await this.scrapeStaticContent(url);
+    }
+  }
+
+  /**
+   * 从 URL 中提取 ID
+   */
+  private extractIdFromUrl(url: string): string {
+    const idMatch = url.match(/\/detail\/([a-z0-9]+)$/);
+    return idMatch ? idMatch[1] : `unknown-${Date.now()}`;
+  }
+
+  /**
+   * 保存 markdown 文件到 Miliastra-knowledge 子模块目录，使用 {id}_{title} 命名格式
+   */
+  private async saveMarkdownFile(
+    markdown: string,
+    outputDir: string,
+    scope: string,
+    documentId: string,
+    title: string,
+    metadata: {
+      title: string;
+      url: string;
+      sourceURL?: string;
+      description?: string;
+      language?: string;
+    },
+    checkChanges: boolean = false
+  ): Promise<boolean> {
+    // 确保 knowledge 目录根路径存在
+    const knowledgeDir = path.join(__dirname, '..', '..'); // knowledge/ 目录
+    const filePath = buildAbsoluteMarkdownPath(knowledgeDir, {
+      id: documentId,
+      title,
+      scope,
+    });
+    await fs.mkdir(path.dirname(filePath), { recursive: true });
+
+    // 生成前置元数据
+    const frontmatter = {
+      id: documentId,
+      title: metadata.title,
+      url: metadata.url,
+      sourceURL: metadata.sourceURL || metadata.url,
+      description: metadata.description,
+      language: metadata.language || 'zh',
+      scope: scope,
+      crawledAt: new Date().toISOString(),
+    };
+
+    // 组合 markdown 内容（前置元数据 + 内容）
+    const markdownContent = `---\n${
+      Object.entries(frontmatter)
+        .map(([key, value]) => `${key}: ${value}`)
+        .join('\n')
+    }\n---\n\n${markdown}`;
+
+    // 检查内容是否变化
+    if (checkChanges) {
+      try {
+        const existingContent = await fs.readFile(filePath, 'utf-8');
+        // 移除 frontmatter
+        const existingMarkdown = existingContent.replace(/^---\n[\s\S]*?\n---\n\n/, '');
+        if (existingMarkdown.trim() === markdown.trim()) {
+          return false; // 内容未变化，跳过保存
+        }
+      } catch (error) {
+        // 文件不存在或读取失败，继续保存
+      }
+    }
+
+    await fs.writeFile(filePath, markdownContent, 'utf-8');
+    return true;
+  }
+}

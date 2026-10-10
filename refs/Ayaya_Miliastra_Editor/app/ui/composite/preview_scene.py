@@ -1,0 +1,514 @@
+"""Graphics preview scene and items for composite node virtual pins."""
+
+from __future__ import annotations
+
+from typing import List, Optional, Tuple
+
+from PyQt6 import QtCore, QtGui, QtWidgets
+
+from engine.layout import UI_HEADER_EXTRA, UI_NODE_PADDING, UI_ROW_HEIGHT
+from engine.nodes.advanced_node_features import CompositeNodeConfig, VirtualPinConfig
+from app.ui.foundation import fonts as ui_fonts
+from app.ui.foundation import input_dialogs
+from app.ui.foundation.context_menu_builder import ContextMenuBuilder
+from app.ui.foundation.interaction_helpers import handle_wheel_zoom_for_view
+from app.ui.foundation.theme_manager import Colors, Sizes, ThemeManager
+from app.ui.foundation.view_utils import fit_view_to_scene_items
+from app.ui.graph.library_mixins import ConfirmDialogMixin
+
+PIN_SIZE = 12
+PIN_SPACING = UI_ROW_HEIGHT
+NODE_PADDING = UI_NODE_PADDING
+MIN_NODE_WIDTH = 250
+HEADER_HEIGHT = UI_ROW_HEIGHT + UI_HEADER_EXTRA
+CORNER_RADIUS = 12
+
+
+class CompositeNodePreviewItem(QtWidgets.QGraphicsItem):
+    """复合节点预览项，使用节点图相同的样式。"""
+
+    def __init__(self, title: str, width: float, height: float):
+        super().__init__()
+        self.title = title
+        self.width = width
+        self.height = height
+        self.title_font = ui_fonts.ui_font(11, bold=True)
+
+    def boundingRect(self) -> QtCore.QRectF:
+        return QtCore.QRectF(-self.width / 2, -self.height / 2, self.width, self.height)
+
+    def paint(self, painter: QtGui.QPainter, option, widget=None) -> None:
+        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+        rect = self.boundingRect()
+        header_h = HEADER_HEIGHT
+
+        title_path = QtGui.QPainterPath()
+        title_path.moveTo(rect.left(), rect.top() + header_h)
+        title_path.lineTo(rect.left(), rect.top() + CORNER_RADIUS)
+        title_path.quadTo(rect.left(), rect.top(), rect.left() + CORNER_RADIUS, rect.top())
+        title_path.lineTo(rect.right() - CORNER_RADIUS, rect.top())
+        title_path.quadTo(rect.right(), rect.top(), rect.right(), rect.top() + CORNER_RADIUS)
+        title_path.lineTo(rect.right(), rect.top() + header_h)
+        title_path.closeSubpath()
+
+        gradient = QtGui.QLinearGradient(rect.topLeft(), rect.topRight())
+        gradient.setColorAt(0.0, QtGui.QColor(Colors.NODE_HEADER_COMPOSITE_START))
+        gradient.setColorAt(1.0, QtGui.QColor(Colors.NODE_HEADER_COMPOSITE_END))
+        painter.fillPath(title_path, QtGui.QBrush(gradient))
+
+        content_rect = QtCore.QRectF(rect.left(), rect.top() + header_h, rect.width(), rect.height() - header_h)
+        content_color = QtGui.QColor(Colors.BG_DARK)
+        content_color.setAlpha(int(255 * 0.7))
+        painter.setBrush(content_color)
+        pen = QtGui.QPen(QtGui.QColor(Colors.NODE_HEADER_COMPOSITE_END))
+        pen.setWidth(2)
+        painter.setPen(pen)
+
+        path = QtGui.QPainterPath()
+        path.addRoundedRect(rect, CORNER_RADIUS, CORNER_RADIUS)
+        painter.drawPath(path)
+
+        painter.setFont(self.title_font)
+        painter.setPen(QtGui.QColor(Colors.TEXT_PRIMARY))
+        title_rect = QtCore.QRectF(rect.left(), rect.top(), rect.width(), header_h)
+        painter.drawText(
+            title_rect.adjusted(12, 0, -12, 0),
+            QtCore.Qt.AlignmentFlag.AlignVCenter | QtCore.Qt.AlignmentFlag.AlignLeft,
+            self.title,
+        )
+
+
+class VirtualPinItem(QtWidgets.QGraphicsItem):
+    """虚拟引脚图形项，支持右键菜单与高亮。"""
+
+    def __init__(self, pin_config: VirtualPinConfig, preview_widget: "CompositeNodePreviewGraphics"):
+        super().__init__()
+        self.pin_config = pin_config
+        self.preview_widget = preview_widget
+        self.number_text = "?"
+        self.label_text = pin_config.pin_name
+        self.setFlag(QtWidgets.QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
+        self.setAcceptedMouseButtons(QtCore.Qt.MouseButton.LeftButton | QtCore.Qt.MouseButton.RightButton)
+        self._update_label_text()
+
+    def _update_label_text(self) -> None:
+        if not self.preview_widget or not self.preview_widget.composite_config:
+            self.label_text = self.pin_config.pin_name
+            return
+        from engine.nodes.composite_node_manager import get_composite_node_manager
+
+        manager = get_composite_node_manager()
+        if not manager:
+            return
+        _, number = manager.get_pin_display_number(
+            self.preview_widget.composite_config.composite_id, self.pin_config
+        )
+        self.number_text = str(number)
+        self.label_text = self.pin_config.pin_name
+
+    def boundingRect(self) -> QtCore.QRectF:
+        port_radius = 6
+        tag_width = 24
+        tag_height = 20
+        font_metrics = QtGui.QFontMetrics(ui_fonts.ui_font(9))
+        text_width = font_metrics.horizontalAdvance(self.label_text)
+        gap = 6
+        if self.pin_config.is_input:
+            left = -tag_width - 8
+            right = port_radius * 2 + gap + text_width
+        else:
+            max_port_width = 20 if self.pin_config.is_flow else port_radius * 2
+            # 文本整体放在端口左侧并预留间距，避免与端口形状重叠
+            left = -text_width - max_port_width - gap
+            right = tag_width + 8
+        return QtCore.QRectF(left, -tag_height / 2, right - left, tag_height)
+
+    def paint(self, painter: QtGui.QPainter, option, widget=None) -> None:
+        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+        port_radius = 6
+        tag_width = 24
+        tag_height = 20
+        tag_radius = tag_height // 2
+        if self.pin_config.is_input:
+            tag_rect = QtCore.QRectF(-tag_width - 8, -tag_height / 2, tag_width, tag_height)
+            gradient = QtGui.QLinearGradient(tag_rect.topLeft(), tag_rect.bottomLeft())
+            gradient.setColorAt(0, QtGui.QColor(Colors.ACCENT_LIGHT))
+            gradient.setColorAt(1, QtGui.QColor(Colors.ACCENT))
+            painter.setBrush(gradient)
+            painter.setPen(QtGui.QPen(QtGui.QColor(Colors.ACCENT), 2))
+            radius = 3 if self.pin_config.is_flow else tag_radius
+            painter.drawRoundedRect(tag_rect, radius, radius)
+
+            painter.setPen(QtGui.QPen(QtGui.QColor(Colors.TEXT_ON_PRIMARY), 1))
+            painter.setFont(ui_fonts.ui_font(10, bold=True))
+            painter.drawText(tag_rect, QtCore.Qt.AlignmentFlag.AlignCenter, self.number_text)
+
+            if self.pin_config.is_flow:
+                port_rect = QtCore.QRectF(0, -8, 20, 16)
+                painter.setPen(QtGui.QPen(QtGui.QColor(Colors.TEXT_ON_PRIMARY), 2))
+                painter.setBrush(QtCore.Qt.BrushStyle.NoBrush)
+                painter.drawRoundedRect(port_rect, 4, 4)
+                port_right = 20
+            else:
+                port_rect = QtCore.QRectF(0, -port_radius, port_radius * 2, port_radius * 2)
+                painter.setPen(QtGui.QPen(QtGui.QColor(Colors.BORDER_LIGHT), 2))
+                painter.setBrush(QtCore.Qt.BrushStyle.NoBrush)
+                painter.drawEllipse(port_rect)
+                port_right = port_radius * 2
+
+            painter.setFont(ui_fonts.ui_font(9))
+            # 在深色画布上使用高对比度文本颜色，避免名称与背景融为一体
+            painter.setPen(QtGui.QColor(Colors.TEXT_ON_PRIMARY))
+            painter.drawText(QtCore.QPointF(port_right + 6, 4), self.label_text)
+        else:
+            painter.setFont(ui_fonts.ui_font(9))
+            font_metrics = QtGui.QFontMetrics(ui_fonts.ui_font(9))
+            text_width = font_metrics.horizontalAdvance(self.label_text)
+
+            # 先绘制端口与序号标签，再绘制文本，避免后画的图形覆盖文字
+            if self.pin_config.is_flow:
+                port_rect = QtCore.QRectF(-20, -8, 20, 16)
+                painter.setPen(QtGui.QPen(QtGui.QColor(Colors.TEXT_ON_PRIMARY), 2))
+                painter.setBrush(QtCore.Qt.BrushStyle.NoBrush)
+                painter.drawRoundedRect(port_rect, 4, 4)
+                status_width = 20
+            else:
+                port_rect = QtCore.QRectF(-port_radius * 2, -port_radius, port_radius * 2, port_radius * 2)
+                painter.setPen(QtGui.QPen(QtGui.QColor(Colors.TEXT_ON_PRIMARY), 2))
+                painter.setBrush(QtCore.Qt.BrushStyle.NoBrush)
+                painter.drawEllipse(port_rect)
+                status_width = port_radius * 2
+
+            tag_rect = QtCore.QRectF(8, -tag_height / 2, tag_width, tag_height)
+            gradient = QtGui.QLinearGradient(tag_rect.topLeft(), tag_rect.bottomLeft())
+            gradient.setColorAt(0, QtGui.QColor(Colors.ACCENT_LIGHT))
+            gradient.setColorAt(1, QtGui.QColor(Colors.ACCENT))
+            painter.setBrush(gradient)
+            painter.setPen(QtGui.QPen(QtGui.QColor(Colors.ACCENT), 2))
+            radius = 3 if self.pin_config.is_flow else tag_radius
+            painter.drawRoundedRect(tag_rect, radius, radius)
+
+            painter.setPen(QtGui.QPen(QtGui.QColor(Colors.TEXT_ON_PRIMARY), 1))
+            painter.setFont(ui_fonts.ui_font(10, bold=True))
+            painter.drawText(tag_rect, QtCore.Qt.AlignmentFlag.AlignCenter, self.number_text)
+
+            # 文本整体放在端口左侧并预留间距，避免与端口重叠
+            text_x = -text_width - status_width - 6
+            painter.setFont(ui_fonts.ui_font(9))
+            painter.setPen(QtGui.QColor(Colors.TEXT_ON_PRIMARY))
+            painter.drawText(QtCore.QPointF(text_x, 4), self.label_text)
+
+    def contextMenuEvent(self, event: QtGui.QContextMenuEvent) -> None:
+        builder = ContextMenuBuilder()
+        builder.add_action("🔗 开启合并模式", self._start_merge_mode)
+        builder.add_action("🗑️ 删除引脚", self._delete_pin)
+        builder.exec_global(event.screenPos())
+
+    def _start_merge_mode(self) -> None:
+        if self.preview_widget:
+            self.preview_widget.enter_merge_mode(self.pin_config)
+
+    def _delete_pin(self) -> None:
+        if self.preview_widget:
+            self.preview_widget.delete_pin(self.pin_config)
+
+
+class CompositeNodePreviewGraphics(QtWidgets.QGraphicsView, ConfirmDialogMixin):
+    """复合节点预览图，负责展示虚拟引脚与网格背景。"""
+
+    pin_deleted = QtCore.pyqtSignal(VirtualPinConfig)
+    pins_merged = QtCore.pyqtSignal(list, str)
+
+    def __init__(self, parent: QtWidgets.QWidget | None = None):
+        super().__init__(parent)
+        self.composite_config: Optional[CompositeNodeConfig] = None
+        self.pin_items: List[VirtualPinItem] = []
+        self.merge_mode_active = False
+        self.merge_base_pin: Optional[VirtualPinConfig] = None
+        self.grid_size = 50
+        self.panning_active = False
+        self.pan_start_position = QtCore.QPointF()
+        self.horizontal_scroll_start = 0
+        self.vertical_scroll_start = 0
+        self.user_adjusted_view = False
+
+        self.scene = QtWidgets.QGraphicsScene(self)
+        self.setScene(self.scene)
+        self.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+        self.setDragMode(QtWidgets.QGraphicsView.DragMode.NoDrag)
+        self.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.setTransformationAnchor(QtWidgets.QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        self.setResizeAnchor(QtWidgets.QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        self.merge_toolbar = QtWidgets.QWidget(self)
+        self.merge_toolbar.hide()
+        self._setup_merge_toolbar()
+        self.setStyleSheet(
+            f"""
+            QGraphicsView {{
+                border: 1px solid {Colors.BORDER_LIGHT};
+                border-radius: {Sizes.RADIUS_MEDIUM}px;
+            }}
+        """
+        )
+
+    def load_composite(self, composite: CompositeNodeConfig) -> None:
+        self.composite_config = composite
+        self.user_adjusted_view = False
+        self._render_preview()
+
+    def highlight_pin_names(self, pin_names: List[str]) -> None:
+        if not pin_names:
+            return
+        names = set(pin_names)
+        for pin_item in self.pin_items:
+            pin_name = pin_item.pin_config.pin_name
+            pin_item.setSelected(pin_name in names)
+            pin_item.setOpacity(1.0 if pin_name in names else 0.3)
+        self.scene.update()
+        self.viewport().update()
+
+    def clear_highlight(self) -> None:
+        for pin_item in self.pin_items:
+            pin_item.setSelected(False)
+            pin_item.setOpacity(1.0)
+        self.scene.update()
+        self.viewport().update()
+
+    def drawBackground(self, painter: QtGui.QPainter, rect: QtCore.QRectF) -> None:  # noqa: N802
+        ThemeManager.draw_grid_background(painter, rect, self.grid_size)
+
+    def _setup_merge_toolbar(self) -> None:
+        layout = QtWidgets.QHBoxLayout(self.merge_toolbar)
+        layout.setContentsMargins(10, 5, 10, 5)
+        self.merge_label = QtWidgets.QLabel("合并模式：选择要合并的引脚")
+        self.merge_label.setStyleSheet(f"color: {Colors.TEXT_PRIMARY}; font-weight: bold;")
+        layout.addWidget(self.merge_label)
+        layout.addStretch()
+        confirm_btn = QtWidgets.QPushButton("✓ 确定合并")
+        confirm_btn.clicked.connect(self._confirm_merge)
+        layout.addWidget(confirm_btn)
+        cancel_btn = QtWidgets.QPushButton("✕ 取消")
+        cancel_btn.clicked.connect(self._cancel_merge)
+        layout.addWidget(cancel_btn)
+        self.merge_toolbar.setStyleSheet(
+            f"""
+            QWidget {{
+                background-color: {Colors.BG_SELECTED};
+                border-radius: {Sizes.RADIUS_SMALL}px;
+            }}
+            {ThemeManager.button_style()}
+        """
+        )
+
+    def _render_preview(self) -> None:
+        self.scene.clear()
+        self.pin_items.clear()
+        if not self.composite_config:
+            text_item = self.scene.addText("暂无复合节点\n\n右键内部节点的端口\n可暴露为虚拟引脚")
+            text_item.setDefaultTextColor(QtGui.QColor(Colors.TEXT_SECONDARY))
+            text_item.setFont(ui_fonts.ui_font(12))
+            text_item.setPos(-80, -40)
+            return
+
+        node_height = self._compute_height(self.composite_config.virtual_pins)
+        node_width = MIN_NODE_WIDTH
+        node_preview = CompositeNodePreviewItem(self.composite_config.node_name, node_width, node_height)
+        node_preview.setPos(0, 0)
+        node_preview.setZValue(0)
+        self.scene.addItem(node_preview)
+
+        self._create_pins(node_width, node_height, is_input=True)
+        self._create_pins(node_width, node_height, is_input=False)
+
+        items_rect = self.scene.itemsBoundingRect()
+        self.scene.setSceneRect(items_rect.adjusted(-50, -30, 50, 30))
+        self.scene.update()
+        self.viewport().update()
+        if not self.user_adjusted_view:
+            QtCore.QTimer.singleShot(50, lambda: fit_view_to_scene_items(self, self.scene))
+
+    def _compute_height(self, pins: List[VirtualPinConfig]) -> float:
+        input_flow = len([pin for pin in pins if pin.is_input and pin.is_flow])
+        input_data = len([pin for pin in pins if pin.is_input and not pin.is_flow])
+        output_flow = len([pin for pin in pins if not pin.is_input and pin.is_flow])
+        output_data = len([pin for pin in pins if not pin.is_input and not pin.is_flow])
+
+        total_input_rows = input_flow + input_data
+        total_output_rows = output_flow + output_data
+        max_rows = max(total_input_rows, total_output_rows, 1)
+
+        return HEADER_HEIGHT + max_rows * PIN_SPACING + NODE_PADDING * 2
+
+    def _create_pins(self, node_width: float, node_height: float, *, is_input: bool) -> None:
+        if not self.composite_config:
+            return
+        y_start = -node_height / 2 + HEADER_HEIGHT + NODE_PADDING
+
+        # 调试输出：观察预览图中每一侧的虚拟引脚分布
+        side = "输入" if is_input else "输出"
+        all_pins = self.composite_config.virtual_pins or []
+        flow_pins = [
+            p for p in all_pins if p.is_input == is_input and p.is_flow
+        ]
+        data_pins = [
+            p for p in all_pins if p.is_input == is_input and not p.is_flow
+        ]
+        print(
+            f"[CompositePreview] {self.composite_config.composite_id} {side} 侧："
+            f"流程引脚={len(flow_pins)}, 数据引脚={len(data_pins)}"
+        )
+        for pin in flow_pins + data_pins:
+            kind = "流程" if pin.is_flow else "数据"
+            print(
+                f"[CompositePreview]  - 索引={pin.pin_index}, 类型={kind}, 名称={pin.pin_name}"
+            )
+
+        groups = [
+            [
+                p
+                for p in self.composite_config.virtual_pins
+                if p.is_input == is_input and p.is_flow
+            ],
+            [
+                p
+                for p in self.composite_config.virtual_pins
+                if p.is_input == is_input and not p.is_flow
+            ],
+        ]
+        for group in groups:
+            group.sort(key=lambda p: p.pin_index)
+            for pin in group:
+                pin_item = VirtualPinItem(pin, self)
+                pin_item.setZValue(10)
+                x_pos = -node_width / 2 if is_input else node_width / 2
+                pin_item.setPos(x_pos, y_start)
+                self.scene.addItem(pin_item)
+                self.pin_items.append(pin_item)
+                y_start += PIN_SPACING
+
+    def enter_merge_mode(self, base_pin: VirtualPinConfig) -> None:
+        self.merge_mode_active = True
+        self.merge_base_pin = base_pin
+        self.merge_toolbar.show()
+        self.merge_toolbar.setGeometry(0, 0, self.width(), 40)
+        for pin_item in self.pin_items:
+            pin = pin_item.pin_config
+            if self._can_merge_with_base(pin):
+                pin_item.setFlag(QtWidgets.QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
+                if pin == base_pin:
+                    pin_item.setSelected(True)
+            else:
+                pin_item.setFlag(QtWidgets.QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, False)
+                pin_item.setOpacity(0.3)
+
+    def _can_merge_with_base(self, pin: VirtualPinConfig) -> bool:
+        if not self.merge_base_pin:
+            return False
+        if pin.is_input != self.merge_base_pin.is_input:
+            return False
+        if pin.is_flow != self.merge_base_pin.is_flow:
+            return False
+        if pin.pin_type != self.merge_base_pin.pin_type:
+            # “泛型”仅作为“未设置”的占位：允许用它作为合并兼容的兜底类型（避免类型不同无法合并）。
+            if pin.pin_type != "泛型" and self.merge_base_pin.pin_type != "泛型":
+                return False
+        return True
+
+    def _confirm_merge(self) -> None:
+        selected_pins = [pin_item.pin_config for pin_item in self.pin_items if pin_item.isSelected()]
+        if len(selected_pins) < 2:
+            self.show_warning("提示", "至少需要选择2个引脚进行合并")
+            return
+        merged_name = input_dialogs.prompt_text(
+            self,
+            "合并引脚",
+            f"将 {len(selected_pins)} 个引脚合并为一个\n请输入合并后的引脚名称：",
+            text=selected_pins[0].pin_name,
+        )
+        if merged_name:
+            self.pins_merged.emit(selected_pins, merged_name)
+        self._cancel_merge()
+
+    def _cancel_merge(self) -> None:
+        self.merge_mode_active = False
+        self.merge_base_pin = None
+        self.merge_toolbar.hide()
+        for pin_item in self.pin_items:
+            pin_item.setSelected(False)
+            pin_item.setOpacity(1.0)
+            pin_item.setFlag(QtWidgets.QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
+
+    def delete_pin(self, pin: VirtualPinConfig) -> None:
+        if self.confirm("确认删除", f"确定要删除引脚 '{pin.pin_name}' 吗？"):
+            self.pin_deleted.emit(pin)
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        if self.merge_toolbar.isVisible():
+            self.merge_toolbar.setGeometry(0, 0, self.width(), 40)
+        if not self.user_adjusted_view and self.scene.sceneRect().isValid():
+            fit_view_to_scene_items(self, self.scene)
+
+    def showEvent(self, event) -> None:  # noqa: N802
+        super().showEvent(event)
+        if not self.user_adjusted_view and self.scene.sceneRect().isValid():
+            QtCore.QTimer.singleShot(50, lambda: fit_view_to_scene_items(self, self.scene))
+
+    def wheelEvent(self, event: QtGui.QWheelEvent) -> None:  # noqa: N802
+        handle_wheel_zoom_for_view(
+            self,
+            event,
+            base_factor_per_step=1.15,
+            min_scale=0.2,
+            max_scale=5.0,
+        )
+        self.user_adjusted_view = True
+        if not event.isAccepted():
+            super().wheelEvent(event)
+
+    def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:  # noqa: N802
+        if event.button() in (
+            QtCore.Qt.MouseButton.MiddleButton,
+            QtCore.Qt.MouseButton.LeftButton,
+        ):
+            target_item = self.itemAt(event.position().toPoint())
+            if event.button() == QtCore.Qt.MouseButton.MiddleButton or target_item is None:
+                self._begin_panning(event)
+                return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:  # noqa: N802
+        if self.panning_active:
+            drag_delta = event.position() - self.pan_start_position
+            self.horizontalScrollBar().setValue(
+                int(self.horizontal_scroll_start - drag_delta.x())
+            )
+            self.verticalScrollBar().setValue(
+                int(self.vertical_scroll_start - drag_delta.y())
+            )
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:  # noqa: N802
+        if self.panning_active and event.button() in (
+            QtCore.Qt.MouseButton.MiddleButton,
+            QtCore.Qt.MouseButton.LeftButton,
+        ):
+            self.panning_active = False
+            self.setCursor(QtCore.Qt.CursorShape.ArrowCursor)
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def _begin_panning(self, event: QtGui.QMouseEvent) -> None:
+        self.panning_active = True
+        self.pan_start_position = event.position()
+        self.horizontal_scroll_start = self.horizontalScrollBar().value()
+        self.vertical_scroll_start = self.verticalScrollBar().value()
+        self.setCursor(QtCore.Qt.CursorShape.ClosedHandCursor)
+        self.user_adjusted_view = True
+        event.accept()
+
+

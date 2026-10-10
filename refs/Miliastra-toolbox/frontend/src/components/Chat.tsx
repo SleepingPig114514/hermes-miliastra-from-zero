@@ -1,0 +1,926 @@
+import { useState, useRef, useEffect } from 'react'
+import { useTranslation } from 'react-i18next'
+
+import {
+  type ChatMessage,
+  type ExtendedMessage,
+  type Message,
+  type SourceMessage,
+  type ToolCallMessage,
+  type ToolTrace,
+} from '../types'
+import { getConfig } from '../utils/config'
+import ConfigModal from './ConfigModal'
+import Markdown from './Markdown'
+import {
+  createNewConversation,
+  saveConversation,
+  getConversation,
+  generateConversationTitle,
+  downloadConversation,
+} from '../utils/conversations'
+import { createShare } from '../utils/share'
+import ConversationView, { buildConversationTurns } from './ConversationView'
+import ShareLinkModal from './ShareLinkModal'
+import PageHeader from './ui/PageHeader'
+import Button from './ui/Button'
+import Textarea from './ui/Textarea'
+import {
+  DownloadIcon,
+  PlusIcon,
+  ShareIcon,
+  ImageIcon,
+  SettingsIcon,
+  SendIcon,
+  TerminalIcon,
+  PuzzleIcon,
+  ImageConvertIcon,
+} from './ui/icons'
+
+interface ChatProps {
+  configVersion: number
+  currentConversationId?: string
+  onConversationChange?: (id: string) => void
+  onRefreshConversations?: () => void
+  onConfigSaved?: () => void
+}
+
+export default function Chat({
+  configVersion,
+  currentConversationId,
+  onConversationChange,
+  onRefreshConversations,
+  onConfigSaved,
+}: ChatProps) {
+  const { t } = useTranslation()
+
+  const getGreeting = () => {
+    const hour = new Date().getHours()
+    if (hour < 12) return t('chat.greetingMorning')
+    if (hour < 18) return t('chat.greetingAfternoon')
+    return t('chat.greetingEvening')
+  }
+
+  const [conversationId, setConversationId] = useState<string>('')
+  const [messages, setMessages] = useState<ExtendedMessage[]>([])
+  const [displayMessages, setDisplayMessages] = useState<ChatMessage[]>([])
+  const [input, setInput] = useState('')
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState('')
+  const [timeoutWarning, setTimeoutWarning] = useState('')
+  const [statusMessage, setStatusMessage] = useState('')
+  const [showConfigHint, setShowConfigHint] = useState(false)
+  const [noticeContent, setNoticeContent] = useState('')
+  const [images, setImages] = useState<{ base64: string; info: string }[]>([])
+  const [agentMode, setAgentMode] = useState(true)
+  const [showConfig, setShowConfig] = useState(false)
+  const [sharing, setSharing] = useState(false)
+  const [shareUrl, setShareUrl] = useState('')
+  const messagesEndRef = useRef<HTMLDivElement>(null)
+  const lastMessageTimeRef = useRef<number>(Date.now())
+  const inputRef = useRef<HTMLTextAreaElement>(null)
+  const scrollContainerRef = useRef<HTMLDivElement>(null)
+  const isAtBottomRef = useRef(true)
+  const reasoningBufferRef = useRef('')
+  const contentBufferRef = useRef('')
+  const flushTimerRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const conversationTurns = buildConversationTurns(displayMessages)
+
+  useEffect(() => {
+    if (inputRef.current) {
+      inputRef.current.style.height = 'auto'
+      inputRef.current.style.height = `${Math.min(inputRef.current.scrollHeight, 160)}px`
+    }
+  }, [input])
+
+  useEffect(() => {
+    if (currentConversationId) {
+      const conv = getConversation(currentConversationId)
+      if (conv) {
+        setConversationId(conv.id)
+        const userAssistantMessages = conv.messages.filter(
+          (m: ChatMessage) => 'role' in m
+        ) as ExtendedMessage[]
+        setMessages(userAssistantMessages)
+        setDisplayMessages(conv.messages as ChatMessage[])
+      }
+    } else if (!conversationId) {
+      const newConv = createNewConversation()
+      setConversationId(newConv.id)
+      setMessages([])
+      setDisplayMessages([])
+      onConversationChange?.(newConv.id)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentConversationId])
+
+  useEffect(() => {
+    if (conversationId && messages.length > 0) {
+      const title = generateConversationTitle(messages)
+      saveConversation({
+        id: conversationId,
+        title,
+        messages: displayMessages,
+        createdAt: parseInt(conversationId.split('_')[1]) || Date.now(),
+        updatedAt: Date.now(),
+      })
+    }
+  }, [messages, conversationId, displayMessages])
+
+  const MAX_IMAGE_SIZE = 1024 * 1024
+
+  const compressImageToBase64 = (
+    file: File
+  ): Promise<{ base64: string; info: string }> => {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader()
+      reader.onload = () => {
+        const img = new Image()
+        img.onload = () => {
+          const canvas = document.createElement('canvas')
+          const ctx = canvas.getContext('2d')
+          if (!ctx) {
+            reject(new Error(t('chat.canvasUnsupported')))
+            return
+          }
+
+          let { width, height } = img
+          const maxDimension = 1280
+          if (width > maxDimension || height > maxDimension) {
+            const ratio = Math.min(maxDimension / width, maxDimension / height)
+            width = Math.round(width * ratio)
+            height = Math.round(height * ratio)
+          }
+
+          canvas.width = width
+          canvas.height = height
+          ctx.drawImage(img, 0, 0, width, height)
+
+          let quality = 0.9
+          let base64 = canvas.toDataURL('image/jpeg', quality)
+
+          while (base64.length * 0.75 > MAX_IMAGE_SIZE && quality > 0.3) {
+            quality -= 0.1
+            base64 = canvas.toDataURL('image/jpeg', quality)
+          }
+
+          const sizeKB = Math.round((base64.length * 0.75) / 1024)
+          if (base64.length * 0.75 > MAX_IMAGE_SIZE) {
+            reject(new Error(t('chat.imageTooLarge')))
+          } else {
+            resolve({ base64, info: t('chat.imageCompressed', { size: sizeKB }) })
+          }
+        }
+        img.onerror = () => reject(new Error(t('chat.imageLoadFailed')))
+        img.src = reader.result as string
+      }
+      reader.onerror = () => reject(new Error(t('chat.imageReadFailed')))
+      reader.readAsDataURL(file)
+    })
+  }
+
+  const addImage = async (file: File) => {
+    if (!file.type.startsWith('image/')) {
+      setError(t('chat.selectImageFile'))
+      return
+    }
+
+    try {
+      setError('')
+      const { base64, info } = await compressImageToBase64(file)
+      setImages((prev) => [...prev, { base64, info }])
+    } catch (e) {
+      setError(e instanceof Error ? e.message : t('chat.imageProcessFailed'))
+    }
+  }
+
+  const handleImageFiles = (files: FileList | null) => {
+    if (!files) return
+    Array.from(files).forEach((file) => addImage(file))
+  }
+
+  const removeImage = (index: number) => {
+    setImages((prev) => prev.filter((_, i) => i !== index))
+  }
+
+  const clearImages = () => {
+    setImages([])
+  }
+
+  const handlePaste = (e: React.ClipboardEvent) => {
+    const items = e.clipboardData.items
+    const imageFiles: File[] = []
+    for (let i = 0; i < items.length; i++) {
+      if (items[i].type.indexOf('image') !== -1) {
+        const file = items[i].getAsFile()
+        if (file) {
+          imageFiles.push(file)
+        }
+      }
+    }
+    if (imageFiles.length > 0) {
+      e.preventDefault()
+      imageFiles.forEach((file) => addImage(file))
+    }
+  }
+
+  const handleNewConversation = () => {
+    const newConv = createNewConversation()
+    setConversationId(newConv.id)
+    setMessages([])
+    setDisplayMessages([])
+    onConversationChange?.(newConv.id)
+    onRefreshConversations?.()
+  }
+
+  const handleDownload = () => {
+    if (conversationId && messages.length > 0) {
+      const title = generateConversationTitle(messages)
+      downloadConversation({
+        id: conversationId,
+        title,
+        messages: displayMessages,
+        createdAt: parseInt(conversationId.split('_')[1]) || Date.now(),
+        updatedAt: Date.now(),
+      })
+    }
+  }
+
+  const handleShare = async () => {
+    if (!conversationId || messages.length === 0 || sharing) return
+    setSharing(true)
+    setError('')
+    try {
+      const title = generateConversationTitle(messages)
+      const result = await createShare({
+        id: conversationId,
+        title,
+        messages: displayMessages,
+        createdAt: parseInt(conversationId.split('_')[1]) || Date.now(),
+        updatedAt: Date.now(),
+      })
+      const shareUrl = `${window.location.origin}${result.url}`
+      setShareUrl(shareUrl)
+    } catch (e) {
+      setError(t('chat.shareFailed', { detail: e instanceof Error ? e.message : '' }))
+    } finally {
+      setSharing(false)
+    }
+  }
+
+  const scrollToBottom = (force = false) => {
+    if (!force && !isAtBottomRef.current) return
+    messagesEndRef.current?.scrollIntoView({
+      behavior: force || !loading ? 'smooth' : 'auto',
+      block: 'end',
+    })
+  }
+
+  useEffect(() => {
+    const el = scrollContainerRef.current
+    if (!el) return
+    const handleScroll = () => {
+      const threshold = 80
+      isAtBottomRef.current =
+        el.scrollHeight - el.scrollTop - el.clientHeight < threshold
+    }
+    el.addEventListener('scroll', handleScroll, { passive: true })
+    return () => el.removeEventListener('scroll', handleScroll)
+  }, [])
+
+  useEffect(() => {
+    scrollToBottom()
+  }, [displayMessages])
+
+  useEffect(() => {
+    const config = getConfig()
+    const needConfig = !config.use_default_model && !config.api_key
+    setShowConfigHint(needConfig)
+  }, [configVersion])
+
+  // 公告内容通过 NOTICE.md 维护，无需 i18n
+  useEffect(() => {
+    fetch('/NOTICE.md')
+      .then((response) => response.text())
+      .then((text) => setNoticeContent(text))
+      .catch((err) => console.warn('Failed to load NOTICE.md:', err))
+  }, [])
+
+  const handleSend = async () => {
+    if ((!input.trim() && images.length === 0) || loading) return
+
+    const config = getConfig()
+    if (!config.use_default_model && !config.api_key) {
+      setShowConfigHint(true)
+      return
+    }
+
+    setShowConfigHint(false)
+    const imageBase64s = images.map((img) => img.base64)
+    const messageText = input.trim() || (imageBase64s.length > 0 ? t('chat.imageQuestion') : '')
+    const userMessage: Message = {
+      role: 'user',
+      content: messageText,
+      imageBase64s: imageBase64s.length > 0 ? imageBase64s : undefined,
+    }
+    setMessages((prev) => [...prev, userMessage])
+    setDisplayMessages((prev) => [...prev, userMessage])
+    setInput('')
+    clearImages()
+    setLoading(true)
+    setError('')
+    setTimeoutWarning('')
+    setStatusMessage('')
+    isAtBottomRef.current = true
+    reasoningBufferRef.current = ''
+    contentBufferRef.current = ''
+
+    let hasCreatedAssistantMessage = false
+
+    const flushStreamBuffer = () => {
+      const reasoningDelta = reasoningBufferRef.current
+      const contentDelta = contentBufferRef.current
+      if (!reasoningDelta && !contentDelta) return
+      reasoningBufferRef.current = ''
+      contentBufferRef.current = ''
+
+      if (!hasCreatedAssistantMessage) {
+        hasCreatedAssistantMessage = true
+        const assistantMessage: ExtendedMessage = {
+          role: 'assistant',
+          content: contentDelta,
+          reasoning: reasoningDelta || undefined,
+          isReasoning: reasoningDelta ? true : undefined,
+        }
+        setMessages((prev) => [...prev, assistantMessage])
+        setDisplayMessages((prev) => [...prev, assistantMessage])
+        return
+      }
+
+      setMessages((prev) => {
+        const newMessages = [...prev]
+        const lastMsg = newMessages[newMessages.length - 1]
+        if (lastMsg && lastMsg.role === 'assistant') {
+          newMessages[newMessages.length - 1] = {
+            ...lastMsg,
+            reasoning: reasoningDelta
+              ? (lastMsg.reasoning || '') + reasoningDelta
+              : lastMsg.reasoning,
+            content: contentDelta
+              ? lastMsg.content + contentDelta
+              : lastMsg.content,
+            isReasoning: reasoningDelta
+              ? true
+              : contentDelta
+                ? false
+                : lastMsg.isReasoning,
+          }
+        }
+        return newMessages
+      })
+      setDisplayMessages((prev) => {
+        for (let i = prev.length - 1; i >= 0; i--) {
+          const msg = prev[i]
+          if ('role' in msg && msg.role === 'assistant') {
+            return [
+              ...prev.slice(0, i),
+              {
+                ...msg,
+                reasoning: reasoningDelta
+                  ? (msg.reasoning || '') + reasoningDelta
+                  : msg.reasoning,
+                content: contentDelta
+                  ? msg.content + contentDelta
+                  : msg.content,
+                isReasoning: reasoningDelta
+                  ? true
+                  : contentDelta
+                    ? false
+                    : msg.isReasoning,
+              },
+              ...prev.slice(i + 1),
+            ]
+          }
+        }
+        return prev
+      })
+    }
+
+    try {
+      const contextMessages = messages.slice(-(config.context_length * 2))
+
+      const controller = new AbortController()
+      const timeoutId = setTimeout(() => controller.abort(), 20 * 60 * 1000)
+
+      const apiUrl = agentMode
+        ? '/api/v1/agent/chat/stream'
+        : '/api/v1/rag/chat/stream'
+      const requestBody = {
+        message: messageText,
+        conversation: contextMessages,
+        config,
+        image_base64s: imageBase64s.length > 0 ? imageBase64s : undefined,
+      }
+
+      const response = await fetch(apiUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(requestBody),
+        signal: controller.signal,
+      })
+
+      clearTimeout(timeoutId)
+
+      if (!response.ok) {
+        let errorDetail = t('chat.requestFailed', { status: response.status })
+        try {
+          const errorText = await response.text()
+          if (errorText) errorDetail = `${errorDetail}: ${errorText}`
+        } catch {
+          // 忽略读取响应体失败
+        }
+        throw new Error(errorDetail)
+      }
+
+      const reader = response.body?.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+
+      lastMessageTimeRef.current = Date.now()
+      let hasShownWarning = false
+
+      const checkTimeout = setInterval(() => {
+        const elapsedTime = Date.now() - lastMessageTimeRef.current
+
+        if (elapsedTime > 5 * 60 * 1000 && !hasShownWarning) {
+          hasShownWarning = true
+          setTimeoutWarning(t('chat.timeoutWarning'))
+        }
+
+        if (elapsedTime > 20 * 60 * 1000) {
+          clearInterval(checkTimeout)
+          reader?.cancel()
+          setError(t('chat.connectionTimeout'))
+          setTimeoutWarning('')
+          setLoading(false)
+        }
+      }, 1000)
+
+      flushTimerRef.current = setInterval(() => flushStreamBuffer(), 80)
+
+      while (reader) {
+        const { done, value } = await reader.read()
+        if (done) {
+          clearInterval(checkTimeout)
+          break
+        }
+
+        lastMessageTimeRef.current = Date.now()
+        buffer += decoder.decode(value, { stream: true })
+        const lines = buffer.split('\n')
+        buffer = lines.pop() || ''
+
+        for (const line of lines) {
+          if (line.startsWith(':')) {
+            const status = line.slice(1).trim()
+            switch (status) {
+              case 'connected':
+                setStatusMessage(t('chat.statusConnected'))
+                break
+              case 'chat_engine_created':
+                setStatusMessage(t('chat.statusEngineReady'))
+                break
+              case 'retrieval_done':
+                setStatusMessage(t('chat.statusRetrievalDone'))
+                break
+              case 'sources_sent':
+                setStatusMessage(t('chat.statusSourcesSent'))
+                break
+              case 'generating':
+                setStatusMessage(t('chat.statusGenerating'))
+                break
+              case 'heartbeat':
+                setStatusMessage(t('chat.statusThinking'))
+                break
+              case 'completed':
+                setStatusMessage('')
+                break
+            }
+            continue
+          }
+
+          if (line.startsWith('data: ')) {
+            try {
+              const data = JSON.parse(line.slice(6))
+
+              if (data.type === 'sources') {
+                if (!agentMode) {
+                  setDisplayMessages((prev) => [
+                    ...prev,
+                    { type: 'sources', sources: data.data },
+                  ])
+                }
+              } else if (data.type === 'tool_call') {
+                const trace: ToolTrace = {
+                  tool: data.data.tool,
+                  args: data.data.args,
+                  status: 'success',
+                  summary: t('chat.callingTool'),
+                }
+                setDisplayMessages((prev) => {
+                  for (let i = prev.length - 1; i >= 0; i--) {
+                    const m = prev[i]
+                    if ('type' in m && m.type === 'tool_trace') {
+                      return [
+                        ...prev.slice(0, i),
+                        { ...m, traces: [...m.traces, trace] },
+                        ...prev.slice(i + 1),
+                      ]
+                    }
+                    if ('role' in m && m.role === 'user') break
+                  }
+                  return [...prev, { type: 'tool_trace', traces: [trace] }]
+                })
+                setStatusMessage(t('chat.statusToolCalling', { tool: data.data.tool }))
+              } else if (data.type === 'tool_result') {
+                setDisplayMessages((prev) => {
+                  for (let i = prev.length - 1; i >= 0; i--) {
+                    const m = prev[i]
+                    if ('type' in m && m.type === 'tool_trace') {
+                      const traces = [...m.traces]
+                      for (let j = traces.length - 1; j >= 0; j--) {
+                        if (traces[j].tool === data.data.tool) {
+                          traces[j] = {
+                            ...traces[j],
+                            status: data.data.status,
+                            summary: data.data.summary,
+                            sources: data.data.sources,
+                          }
+                          break
+                        }
+                      }
+                      return [
+                        ...prev.slice(0, i),
+                        { ...m, traces },
+                        ...prev.slice(i + 1),
+                      ]
+                    }
+                  }
+                  return prev
+                })
+                setStatusMessage('')
+              } else if (data.type === 'status') {
+                setStatusMessage(data.data.message || data.data)
+              } else if (data.type === 'reasoning') {
+                reasoningBufferRef.current += data.data
+              } else if (data.type === 'token') {
+                contentBufferRef.current += data.data
+              } else if (data.type === 'done') {
+                setStatusMessage('')
+                flushStreamBuffer()
+                setDisplayMessages((prev) => {
+                  const newMessages = [...prev]
+                  for (let i = newMessages.length - 1; i >= 0; i--) {
+                    const msg = newMessages[i]
+                    if ('type' in msg && msg.type === 'tool_trace') {
+                      ;(msg as ToolCallMessage).stats =
+                        data.data.stats || data.data
+                      break
+                    }
+                    if ('type' in msg && msg.type === 'sources') {
+                      ;(msg as SourceMessage).tokens = data.data.tokens
+                      break
+                    }
+                  }
+                  return [...newMessages]
+                })
+              } else if (data.type === 'error') {
+                setError(data.data)
+              }
+            } catch {
+              console.warn('解析 SSE 失败:', line)
+            }
+          }
+        }
+      }
+    } catch (err) {
+      console.error('对话流异常:', err)
+      const detail =
+        err instanceof Error
+          ? err.message || '网络错误'
+          : '网络错误'
+      setError(t('chat.connectionError', { detail }))
+    } finally {
+      if (flushTimerRef.current) {
+        clearInterval(flushTimerRef.current)
+        flushTimerRef.current = null
+      }
+      flushStreamBuffer()
+      setLoading(false)
+      setStatusMessage('')
+    }
+  }
+
+  return (
+    <div className="flex flex-col h-full">
+      <PageHeader title={t('chat.title')}>
+        {messages.length > 0 && (
+          <Button
+            variant="outlined"
+            size="sm"
+            onClick={handleDownload}
+            title={t('chat.downloadTitle')}
+          >
+            <DownloadIcon className="w-4 h-4" />
+            <span className="hidden sm:inline">{t('chat.download')}</span>
+          </Button>
+        )}
+        {messages.length > 0 && (
+          <Button
+            variant="outlined"
+            size="sm"
+            onClick={handleShare}
+            disabled={sharing}
+            title={t('chat.shareTitle')}
+          >
+            <ShareIcon className="w-4 h-4" />
+            <span className="hidden sm:inline">
+              {sharing ? t('chat.sharing') : t('chat.share')}
+            </span>
+          </Button>
+        )}
+        <Button variant="tonal" size="sm" onClick={handleNewConversation}>
+          <PlusIcon className="w-4 h-4" />
+          {t('chat.newConversation')}
+        </Button>
+      </PageHeader>
+
+      <div ref={scrollContainerRef} className="flex-1 overflow-y-auto p-4 lg:p-6 space-y-4">
+        {displayMessages.length === 0 && (
+          <div className="flex flex-col items-center justify-center min-h-[60vh] text-on-surface">
+            {/* 欢迎语 */}
+            <div className="text-center mb-8">
+              <div className="text-lg font-medium text-on-surface">
+                {getGreeting()}
+              </div>
+            </div>
+
+            {/* 快捷工具卡片 */}
+            <div className="w-full max-w-2xl px-4">
+              <div className="text-xs font-medium text-on-surface-variant uppercase tracking-wider mb-4 text-center">
+                {t('chat.quickTools')}
+              </div>
+              <div className="grid grid-cols-1 min-[520px]:grid-cols-3 gap-3">
+                <a
+                  href="https://github.com/1475505/miliastra-beyond-simulator"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="group flex flex-col items-center gap-3 p-5 rounded-2xl border border-outline bg-surface/80 backdrop-blur-md transition-all duration-200 hover:border-primary hover:shadow-md hover:-translate-y-0.5"
+                >
+                  <div className="w-11 h-11 rounded-xl bg-primary-container flex items-center justify-center text-on-primary-container group-hover:scale-105 transition-transform">
+                    <TerminalIcon className="w-6 h-6" />
+                  </div>
+                  <div className="text-center">
+                    <div className="font-medium text-sm text-on-surface">
+                      {t('chat.toolSandbox')}
+                    </div>
+                    <div className="text-xs text-on-surface-variant mt-1 leading-relaxed">
+                      {t('chat.toolSandboxDesc')}
+                    </div>
+                  </div>
+                </a>
+
+                <a
+                  href="https://qx.070077.xyz/"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="group flex flex-col items-center gap-3 p-5 rounded-2xl border border-outline bg-surface/80 backdrop-blur-md transition-all duration-200 hover:border-primary hover:shadow-md hover:-translate-y-0.5"
+                >
+                  <div className="w-11 h-11 rounded-xl bg-primary-container flex items-center justify-center text-on-primary-container group-hover:scale-105 transition-transform">
+                    <PuzzleIcon className="w-6 h-6" />
+                  </div>
+                  <div className="text-center">
+                    <div className="font-medium text-sm text-on-surface">
+                      {t('chat.toolPuzzle')}
+                    </div>
+                    <div className="text-xs text-on-surface-variant mt-1 leading-relaxed">
+                      {t('chat.toolPuzzleDesc')}
+                    </div>
+                  </div>
+                </a>
+
+                <a
+                  href="https://qx-img.070077.xyz/"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="group flex flex-col items-center gap-3 p-5 rounded-2xl border border-outline bg-surface/80 backdrop-blur-md transition-all duration-200 hover:border-primary hover:shadow-md hover:-translate-y-0.5"
+                >
+                  <div className="w-11 h-11 rounded-xl bg-primary-container flex items-center justify-center text-on-primary-container group-hover:scale-105 transition-transform">
+                    <ImageConvertIcon className="w-6 h-6" />
+                  </div>
+                  <div className="text-center">
+                    <div className="font-medium text-sm text-on-surface">
+                      {t('chat.toolConvert')}
+                    </div>
+                    <div className="text-xs text-on-surface-variant mt-1 leading-relaxed">
+                      {t('chat.toolConvertDesc')}
+                    </div>
+                  </div>
+                </a>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {showConfigHint && (
+          <div className="text-center px-4">
+            <div className="inline-block bg-primary-container border border-primary/20 rounded-xl px-6 py-4 text-sm max-w-md">
+              <div className="text-on-primary-container mb-2 font-medium">
+                {t('chat.configRequired')}
+              </div>
+              <div className="text-on-primary-container/80">
+                {t('chat.configRequiredHint')}
+              </div>
+            </div>
+          </div>
+        )}
+
+        <ConversationView turns={conversationTurns} />
+
+        {statusMessage && (
+          <div className="text-center px-4">
+            <div className="inline-block bg-blue-50 border border-blue-200 rounded-xl px-6 py-3 text-sm text-blue-700 animate-pulse">
+              {statusMessage}
+            </div>
+          </div>
+        )}
+
+        {timeoutWarning && (
+          <div className="text-center px-4">
+            <div className="inline-block bg-primary-container border border-primary/20 rounded-xl px-6 py-4 text-sm max-w-2xl">
+              <div className="text-on-primary-container mb-2 font-medium">{t('chat.slowResponse')}</div>
+              <div className="text-on-primary-container/80">{timeoutWarning}</div>
+            </div>
+          </div>
+        )}
+
+        {error && (
+          <div className="flex justify-start px-4">
+            <div className="max-w-4xl px-4 py-3 rounded-2xl bg-error-container text-error border border-error/20 text-sm">
+              {error}
+            </div>
+          </div>
+        )}
+
+        <div ref={messagesEndRef} />
+      </div>
+
+      {/* 公告提示 - 内容来自 NOTICE.md，贴合对话框上方 */}
+      {displayMessages.length === 0 && noticeContent.trim() && (
+        <div className="px-4 lg:px-6">
+          <div className="max-w-2xl mx-auto border border-yellow-200/60 bg-yellow-50 px-4 py-2 text-xs text-yellow-700">
+            <div className="prose prose-sm max-w-none prose-a:text-yellow-800 prose-strong:text-yellow-800 prose-headings:text-yellow-800">
+              <Markdown>{noticeContent}</Markdown>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <div className="border-t border-outline bg-surface/70 backdrop-blur-md p-4">
+        <div className="flex flex-col gap-2">
+          <div className="flex items-center gap-2 flex-wrap">
+            <label
+              className={[
+                'flex items-center gap-2 px-3 py-2 text-sm cursor-pointer select-none rounded-full border transition-colors duration-200',
+                agentMode
+                  ? 'border-primary bg-primary-container text-on-primary-container'
+                  : 'border-outline bg-surface text-on-surface-variant hover:border-primary',
+              ].join(' ')}
+              title={t('chat.agentModeTitle')}
+            >
+              <span className={agentMode ? 'font-medium' : ''}>{t('chat.agentMode')}</span>
+              <button
+                type="button"
+                role="switch"
+                aria-checked={agentMode}
+                onClick={() => setAgentMode(!agentMode)}
+                className={[
+                  'relative inline-flex h-5 w-9 items-center rounded-full transition-colors duration-200',
+                  agentMode ? 'bg-primary' : 'bg-outline',
+                ].join(' ')}
+              >
+                <span
+                  className={`inline-block h-3.5 w-3.5 rounded-full bg-on-primary transition-transform duration-200 ${
+                    agentMode ? 'translate-x-[1.125rem]' : 'translate-x-0.5'
+                  }`}
+                />
+              </button>
+            </label>
+
+            <div className="relative group">
+              <label
+                className="flex items-center gap-1.5 px-3 py-2 border border-outline rounded-full bg-surface text-sm text-on-surface-variant cursor-pointer hover:border-primary hover:text-primary transition-colors duration-200"
+                aria-label={t('chat.imageTooltip')}
+              >
+                <ImageIcon className="w-4 h-4" />
+                <span>{t('chat.image')}</span>
+                <input
+                  type="file"
+                  accept="image/*"
+                  multiple
+                  className="hidden"
+                  onChange={(e) => handleImageFiles(e.target.files)}
+                  disabled={loading}
+                />
+              </label>
+              <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 px-2 py-1 bg-on-surface text-surface text-xs rounded-lg opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all whitespace-nowrap pointer-events-none z-50">
+                {t('chat.imageTooltip')}
+              </div>
+            </div>
+
+            <Button
+              variant="outlined"
+              size="sm"
+              onClick={() => setShowConfig(true)}
+              title={t('chat.configButton')}
+            >
+              <SettingsIcon className="w-4 h-4" />
+              {t('chat.configButton')}
+            </Button>
+          </div>
+
+          <div className="flex items-end gap-2">
+            <Textarea
+              ref={inputRef}
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && !e.shiftKey) {
+                  e.preventDefault()
+                  handleSend()
+                }
+              }}
+              onPaste={handlePaste}
+              placeholder={t('chat.inputPlaceholder')}
+              disabled={loading}
+              rows={1}
+              className="flex-1 min-w-0 py-2.5"
+              style={{ minHeight: '40px', maxHeight: '160px' }}
+            />
+            <Button
+              onClick={handleSend}
+              disabled={loading || (!input.trim() && images.length === 0)}
+              size="md"
+              className="shrink-0"
+            >
+              {loading ? '…' : <SendIcon className="w-4 h-4" />}
+              <span className="hidden sm:inline">
+                {loading ? t('common.sending') : t('common.send')}
+              </span>
+            </Button>
+          </div>
+
+          {images.length > 0 && (
+            <div className="flex flex-wrap items-center gap-3">
+              {images.map((img, idx) => (
+                <div
+                  key={`${img.base64.slice(0, 32)}_${idx}`}
+                  className="flex items-center gap-2 bg-surface border border-outline rounded-xl px-2 py-1"
+                >
+                  <img
+                    src={img.base64}
+                    alt={t('chat.selectedImageAlt', { index: idx + 1 })}
+                    className="w-16 h-16 object-cover rounded-lg border border-outline"
+                  />
+                  <div className="text-xs text-on-surface-variant">
+                    <div>{img.info || t('chat.sizeCalculating')}</div>
+                    <button
+                      type="button"
+                      onClick={() => removeImage(idx)}
+                      className="mt-1 text-xs text-error hover:underline"
+                      disabled={loading}
+                    >
+                      {t('common.remove')}
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+        <div className="text-center text-xs text-on-surface-variant mt-2">
+          {t('chat.footer')}
+        </div>
+      </div>
+      {showConfig && (
+        <ConfigModal
+          onClose={() => setShowConfig(false)}
+          onConfigSaved={onConfigSaved}
+        />
+      )}
+      {shareUrl && (
+        <ShareLinkModal url={shareUrl} onClose={() => setShareUrl('')} />
+      )}
+    </div>
+  )
+}

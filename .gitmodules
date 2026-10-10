@@ -1,0 +1,25 @@
+# 本仓随附的 4 个上游子模块。
+#
+# 这些目录在源工作区里同样是空的（从未初始化）。本仓把它们注册为 submodule，
+# 使 `git clone --recurse-submodules` 能自动拉齐内容，避免"clone 完发现目录是空的"。
+#
+# 只拉子模块内容（目录已存在时）：
+#     git submodule update --init --recursive
+# 或交给一键脚本：
+#     python tools/bootstrap.py
+
+[submodule "refs/Miliastra-toolbox/knowledge/Miliastra-knowledge"]
+	path = refs/Miliastra-toolbox/knowledge/Miliastra-knowledge
+	url = https://github.com/1475505/Miliastra-knowledge.git
+
+[submodule "refs/WebMiliastraNodesEditor/Genshin-Impact-Miliastra-Wonderland-Code-Node-Editor-Pack"]
+	path = refs/WebMiliastraNodesEditor/Genshin-Impact-Miliastra-Wonderland-Code-Node-Editor-Pack
+	url = https://github.com/Wu-Yijun/Genshin-Impact-Miliastra-Wonderland-Code-Node-Editor-Pack.git
+
+[submodule "refs/WebMiliastraNodesEditor/WebMiliastraNodesEditor-CollabServer"]
+	path = refs/WebMiliastraNodesEditor/WebMiliastraNodesEditor-CollabServer
+	url = https://github.com/Columbina-Dev/WebMiliastraNodesEditor-CollabServer.git
+
+[submodule "refs/WebMiliastraNodesEditor/WebMiliastraNodesEditor-MCPServer"]
+	path = refs/WebMiliastraNodesEditor/WebMiliastraNodesEditor-MCPServer
+	url = https://github.com/Columbina-Dev/WebMiliastraNodesEditor-MCPServer.git
