@@ -39,6 +39,7 @@ python tools/bootstrap.py --all
 |---|---|---|
 | 工作区全部文件（6319 个） | ✅ **齐全，且逐字节与原工作区一致** | 含上游 16 个项目的完整文件 |
 | 4 个子模块 | ✅ 需 `--recurse-submodules` | 若漏了该参数，目录为空：`git submodule update --init --recursive` 补拉 |
+| ⚠️ **子模块的网络前提** | — | 这 4 个子模块的**上游仓库均在 GitHub**（见 `.gitmodules`）。**国内网络下 github.com 直连不通**，`--recurse-submodules` 会失败；先设代理再拉，例如 `set HTTPS_PROXY=http://127.0.0.1:<端口>`（Windows）／`export HTTPS_PROXY=…`（Linux/macOS）。**主仓内容不受影响，仅子模块需要** |
 | 模拟器构建产物 `dist/`、`presets/` | ✅ 已随附 | 上游 `.gitignore` 排除项，本仓已一并打包，**无需 `pnpm build`** |
 | `node_modules/` | ⚠️ 未随附 | 平台相关依赖，需自行 `pnpm install && pnpm build`（任何 JS 项目皆然） |
 | `projects/` | ⚠️ 未随附 | 作者的个人关卡产物（见上表） |
