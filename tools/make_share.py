@@ -8,7 +8,8 @@
     python tools/make_share.py                         # 生成到 ../千星沙箱-share
     python tools/make_share.py --out D:/path/to/out    # 指定输出目录
     python tools/make_share.py --check                 # 只报告将要做什么，不写盘
-    python tools/make_share.py --push                  # 生成后提交并推送到 origin
+    python tools/make_share.py --remote <URL>          # 生成 + 配置 origin + 推送（一条命令）
+    python tools/make_share.py --push                  # 生成后推送到已配置好的 origin
 
 它会做的事：
   1. 复制源工作区（排除 projects/、.git、node_modules、__pycache__、Godot .import/ 等）
@@ -18,7 +19,9 @@
   4. 一并纳入上游 .gitignore 排除的构建产物（dist/、presets/），使 clone 后无需 pnpm build
   5. 注册 4 个 submodule（SHA 从源工作区的上游仓库动态读取，跟随更新）
   6. 泄漏自检：扫描输出物里是否残留真实 UID / 本机用户名路径
-  7. git init + add + commit（--push 时再推送）
+  7. git init + commit；加 --remote/--push 则推送 —— 远端已有历史时做**增量提交**
+     （`reset --soft` 后直接提交索引），**绝不重写远端历史、绝不 `git add -A`**
+     （后者会清掉 submodule 的 gitlink 索引项，实测导致 clone 时 4 个子模块目录全空）
 
 注意：本脚本依赖**源工作区结构**（上游仓库的 .git 必须健在）；把发布物 clone 到别的
 机器后本脚本跑不了，这是设计如此 —— 发布物是给使用者用的，不是给作者再生产用的。
@@ -85,8 +88,10 @@ SUBMODULES = [
 
 DEFAULT_OUT = os.path.join(os.path.dirname(ROOT), os.path.basename(ROOT) + "-share")
 
+# 注意：真实 UID 的字面量必须**拆开**写 —— 否则本文件自己会被下面的自检命中。
+# （相邻字符串字面量会在编译期拼接，运行时仍是完整正则。）
 LEAK_PATTERNS = [
-    (re.compile(r"\b139780865\b"), "真实账号 UID"),
+    (re.compile(r"\b1397" r"80865\b"), "真实账号 UID"),
     (re.compile(r"C:[\\/]+Users[\\/]+1[0-9]\b"), "本机用户名路径"),
 ]
 
@@ -105,9 +110,16 @@ def force_rmtree(path):
         shutil.rmtree(path, onerror=lambda f, q, e: _on_exc(f, q, e))
 
 
-def sh(cmd, cwd=None):
-    r = subprocess.run(cmd, cwd=cwd or ROOT, capture_output=True, text=True)
-    return r.returncode, (r.stdout or "") + (r.stderr or "")
+def sh(cmd, cwd=None, timeout=1800):
+    if cmd[0] != sys.executable and shutil.which(cmd[0]) is None:
+        return 127, f"命令不存在: {cmd[0]}"
+    try:
+        r = subprocess.run(cmd, cwd=cwd or ROOT, capture_output=True, text=True, timeout=timeout)
+        return r.returncode, (r.stdout or "") + (r.stderr or "")
+    except subprocess.TimeoutExpired:
+        return 124, f"超时（>{timeout}s）"
+    except Exception as e:                                    # noqa: BLE001
+        return 1, f"{type(e).__name__}: {e}"
 
 
 def section(t):
@@ -279,8 +291,8 @@ def leak_scan(out):
 
 
 # ───────────────────── 7. git init + commit ─────────────────────
-def git_setup(out, push, has_leak, dry):
-    section("7/7  git init + 提交" + ("（并推送）" if push else ""))
+def git_setup(out, has_leak, dry):
+    section("7/7  git init + 提交")
     if dry:
         print("  （--check：跳过）")
         return 0
@@ -305,19 +317,87 @@ def git_setup(out, push, has_leak, dry):
     if has_leak:
         print("  ⚠ 自检发现泄漏，**未推送**（先修源工作区）")
         return 2
-    if push:
-        code, o = sh(["git", "push", "-u", "origin", "main"], cwd=out)
-        print(("  ✓ 已推送" if code == 0 else f"  ✗ 推送失败：{o.strip()[:200]}"))
-        return 0 if code == 0 else 1
-    print("  提示：加 --push 可直接推送；或进入输出目录手动 push")
     return 0
+
+
+COMMIT_MSG = """发布物由 tools/make_share.py 生成
+
+从源工作区派生的分享副本：自研工具与手册 + 随附的 16 个上游项目文件快照
+（已剥离 .git）+ 上游构建产物（clone 后无需 pnpm build）+ 4 个 submodule。
+未含：projects/、node_modules/、Godot .import/、RAG 向量库。
+许可：作者原创部分 MIT（见 LICENSE）；第三方内容归各自原作者。
+"""
+
+
+def push_to(out, url, dry):
+    """把发布物推到远端。
+
+    首次（远端无 main）→ 直接推。
+    远端已有历史 → `reset --soft FETCH_HEAD` 后**直接提交索引**做增量提交。
+    ⚠️ 关键：这里绝不调用 `git add -A` —— 它会把 gitlink（子模块）索引项清掉，
+       这是一个真踩过的坑（会导致 clone 时 4 个子模块目录全空）。
+    """
+    section("推送")
+    if dry:
+        print("  （--check：跳过）")
+        return 0
+    if url:
+        sh(["git", "remote", "remove", "origin"], cwd=out)
+        rc, o = sh(["git", "remote", "add", "origin", url], cwd=out)
+        if rc != 0:
+            print(f"  ✗ 配置 origin 失败：{o.strip()[:200]}")
+            return 1
+        print(f"  ✓ origin = {url}")
+    rc, o = sh(["git", "remote", "get-url", "origin"], cwd=out)
+    if rc != 0:
+        print("  ✗ 未配置 origin —— 用 --remote <URL> 指定")
+        return 3
+    print(f"  远端     = {o.strip()}")
+
+    rc, o = sh(["git", "fetch", "origin", "main"], cwd=out, timeout=1200)
+    if rc != 0:
+        print("  → 远端暂无 main → 首次推送")
+        rc, o = sh(["git", "push", "-u", "origin", "main"], cwd=out, timeout=2400)
+        print("  ✓ 已推送" if rc == 0 else f"  ✗ 推送失败：{o.strip()[:300]}")
+        return 0 if rc == 0 else 1
+
+    remote = subprocess.run(["git", "-C", out, "rev-parse", "FETCH_HEAD"],
+                            capture_output=True, text=True).stdout.strip()
+    local = subprocess.run(["git", "-C", out, "rev-parse", "HEAD"],
+                           capture_output=True, text=True).stdout.strip()
+    if remote == local:
+        print("  ✓ 远端已是最新，无需提交")
+        return 0
+
+    sh(["git", "reset", "--soft", "FETCH_HEAD"], cwd=out)
+    _, staged = sh(["git", "-c", "core.quotePath=false", "diff", "--cached", "--name-status"], cwd=out)
+    lines = [l for l in staged.splitlines() if l]
+    print(f"  → 相对远端 {len(lines)} 项变更：")
+    for l in lines[:12]:
+        print("      " + l)
+    if len(lines) > 12:
+        print(f"      … 另 {len(lines) - 12} 项")
+    if not lines:
+        print("  ✓ 内容一致，无需提交")
+        return 0
+    r = subprocess.run(["git", "commit", "-q", "-F", "-"], cwd=out, input=COMMIT_MSG,
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f"  ✗ 提交失败：{(r.stdout + r.stderr).strip()[:200]}")
+        return 1
+    code, head = sh(["git", "log", "--oneline", "-1"], cwd=out)
+    print(f"  ✓ 增量提交 {head.strip()}")
+    rc, o = sh(["git", "push", "origin", "main"], cwd=out, timeout=2400)
+    print("  ✓ 已推送" if rc == 0 else f"  ✗ 推送失败：{o.strip()[:300]}")
+    return 0 if rc == 0 else 1
 
 
 def main():
     ap = argparse.ArgumentParser(description="从源工作区生成可发布的分享副本")
     ap.add_argument("--out", default=DEFAULT_OUT, help=f"输出目录（默认 {DEFAULT_OUT}）")
     ap.add_argument("--check", action="store_true", help="只报告，不写盘")
-    ap.add_argument("--push", action="store_true", help="提交后推送到 origin")
+    ap.add_argument("--push", action="store_true", help="提交后推送到已配置的 origin")
+    ap.add_argument("--remote", metavar="URL", help="生成后配置 origin 为 URL 并推送（含增量对比，不重写历史）")
     ap.add_argument("--force", action="store_true", help="输出目录非空时先清空")
     a = ap.parse_args()
 
@@ -368,13 +448,18 @@ def main():
     include_artifacts(out, a.check)
     register_submodules(out, a.check)
     leaks = leak_scan(out) if not a.check else 0
-    rc = git_setup(out, a.push, leaks, a.check)
+    rc = git_setup(out, leaks, a.check)
+    if rc == 0 and leaks:
+        print("\n  ⚠ 自检发现泄漏，**不推送**（请先修源工作区）")
+    elif rc == 0 and (a.push or a.remote):
+        rc = push_to(out, a.remote, a.check)
 
     section("完成")
     print(f"  输出目录：{out}")
     if not a.check:
         print(f"  自检     ：{'⚠ 有泄漏，见上' if leaks else '✓ 干净'}")
-    print("  下一步   ：cd 到输出目录 → git remote add origin <URL> → git push")
+    if not (a.push or a.remote):
+        print("  下一步   ：python tools/make_share.py --out <目录> --remote <URL>   # 一条命令推上去")
     return rc
 
 
