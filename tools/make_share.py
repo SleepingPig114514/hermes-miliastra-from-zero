@@ -8,7 +8,8 @@
     python tools/make_share.py                         # 生成到 ../千星沙箱-share
     python tools/make_share.py --out D:/path/to/out    # 指定输出目录
     python tools/make_share.py --check                 # 只报告将要做什么，不写盘
-    python tools/make_share.py --remote <URL>          # 生成 + 配置 origin + 推送（一条命令）
+    python tools/make_share.py --remote <URL>          # 生成 + 推送（一条命令）
+    python tools/make_share.py --remote <URL1> <URL2>  # 多宿主一次同步（如 GitHub + Gitee）
     python tools/make_share.py --push                  # 生成后推送到已配置好的 origin
 
 它会做的事：
@@ -329,18 +330,35 @@ COMMIT_MSG = """发布物由 tools/make_share.py 生成
 """
 
 
-def push_to(out, url, dry):
-    """把发布物推到远端。
+def push_all(out, urls, dry):
+    """把发布物推到 1..N 个远端，逐个独立推导增量。
 
     首次（远端无 main）→ 直接推。
     远端已有历史 → `reset --soft FETCH_HEAD` 后**直接提交索引**做增量提交。
     ⚠️ 关键：这里绝不调用 `git add -A` —— 它会把 gitlink（子模块）索引项清掉，
        这是一个真踩过的坑（会导致 clone 时 4 个子模块目录全空）。
+
+    多远端语义：**逐个处理，各自独立**。每个远端都从它自己的 HEAD 重新推导差异，
+    因此跨宿主（GitHub + Gitee）历史不同也各自成立；代价是两端 commit SHA 必然不同
+    （内容相同、历史不同），对比一致性要比 tree 而不是比 commit。
+    某个远端失败不中断其余，最后统一返回非 0。
     """
-    section("推送")
     if dry:
+        section("推送")
         print("  （--check：跳过）")
         return 0
+    rc_all = 0
+    for i, url in enumerate(urls, 1):
+        print(f"\n{'=' * 68}")
+        print(f" 推送到 #{i}：{url or '（使用已配置的 origin）'}")
+        print('=' * 68)
+        rc = _push_one(out, url)
+        rc_all = rc_all or rc
+    return rc_all
+
+
+def _push_one(out, url):
+    section("推送")
     if url:
         sh(["git", "remote", "remove", "origin"], cwd=out)
         rc, o = sh(["git", "remote", "add", "origin", url], cwd=out)
@@ -397,7 +415,8 @@ def main():
     ap.add_argument("--out", default=DEFAULT_OUT, help=f"输出目录（默认 {DEFAULT_OUT}）")
     ap.add_argument("--check", action="store_true", help="只报告，不写盘")
     ap.add_argument("--push", action="store_true", help="提交后推送到已配置的 origin")
-    ap.add_argument("--remote", metavar="URL", help="生成后配置 origin 为 URL 并推送（含增量对比，不重写历史）")
+    ap.add_argument("--remote", metavar="URL", nargs="+",
+                    help="生成后推送（可给多个 URL，逐个同步；含增量对比，不重写历史）")
     ap.add_argument("--force", action="store_true", help="输出目录非空时先清空")
     a = ap.parse_args()
 
@@ -452,14 +471,16 @@ def main():
     if rc == 0 and leaks:
         print("\n  ⚠ 自检发现泄漏，**不推送**（请先修源工作区）")
     elif rc == 0 and (a.push or a.remote):
-        rc = push_to(out, a.remote, a.check)
+        targets = a.remote if a.remote else [None]      # None = 用已配置的 origin
+        rc = push_all(out, targets, a.check)
 
     section("完成")
     print(f"  输出目录：{out}")
     if not a.check:
         print(f"  自检     ：{'⚠ 有泄漏，见上' if leaks else '✓ 干净'}")
     if not (a.push or a.remote):
-        print("  下一步   ：python tools/make_share.py --out <目录> --remote <URL>   # 一条命令推上去")
+        print("  下一步   ：python tools/make_share.py --out <目录> --remote <URL> [<URL2> …]")
+        print("             （多个 URL 可一次同步多宿主，例如 GitHub + Gitee）")
     return rc
 
 
